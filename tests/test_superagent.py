@@ -1,3 +1,4 @@
+import asyncio
 import os
 import time
 from pathlib import Path
@@ -192,3 +193,37 @@ async def test_brain_synthesis():
     assert "[CODEX]" in synthesis
     assert "[AGY]" in synthesis
     assert "Repository changes detected" in synthesis
+
+@pytest.mark.asyncio
+async def test_markup_crash_resilience():
+    from superagent.tui.app import SuperagentApp
+    app = SuperagentApp()
+    async with app.run_test() as pilot:
+        task = app.runner.create_task(
+            agent="codex",
+            task_desc="Review [bracketed code] test",
+            project_name="testproj",
+            cwd=".",
+            effort="medium"
+        )
+        task.log_lines = [
+            ' 300   hlog.write(f"    \\x07 [{s.agent.upper()} ({s.effort})]"',
+            'for item in [1, 2, 3]: print(item[0])',
+            '[unclosed markup tag',
+            'def foo(x: list[int]) -> dict[str, Any]:'
+        ]
+        
+        # Test 1: select_task with raw code lines containing square brackets
+        app.select_task(task.task_id)
+
+        # Test 2: live log stream with square brackets
+        app.runner._notify(task, "log")
+
+        # Test 3: user prompt containing square brackets
+        input_widget = app.query_one("#prompt-input")
+        input_widget.value = "check [bracketed input] [0] and [foo]"
+        await pilot.press("enter")
+        await asyncio.sleep(0.2)
+        
+        # Verify app is still running and did not crash
+        assert app.is_running is True

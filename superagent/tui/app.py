@@ -10,6 +10,8 @@ from textual.binding import Binding
 from textual.containers import Container, Horizontal, Vertical, VerticalScroll
 from textual.message import Message
 from textual.widgets import Footer, Header, Input, Label, RichLog, Static, TabbedContent, TabPane
+from rich.markup import escape
+from rich.text import Text
 
 from superagent.brain import SuperagentBrain
 from superagent.config import SuperagentConfig, ProjectConfig
@@ -221,7 +223,7 @@ class SuperagentApp(App):
                         yield RichLog(id="superagent-feed", highlight=True, markup=True, wrap=True)
                         yield Static("[dim]⚡ Fleet idle • Standing by for next instruction[/dim]", id="feed-status-bar")
                     with TabPane("💻 Subagent Console", id="tab-console"):
-                        yield RichLog(id="subagent-log", highlight=True, markup=True, wrap=True)
+                        yield RichLog(id="subagent-log", highlight=False, markup=False, wrap=True)
                     with TabPane("📜 History", id="tab-history"):
                         yield RichLog(id="history-log", highlight=True, markup=True, wrap=True)
 
@@ -287,24 +289,24 @@ class SuperagentApp(App):
             return
 
         for idx, item in enumerate(turns, 1):
-            hlog.write(f"[bold yellow]Turn #{idx} — [{item.timestamp}][/bold yellow] [dim]({item.project_name})[/dim]")
-            hlog.write(f"  [bold green]❯ User Request:[/bold green] {item.user_prompt}")
+            hlog.write(f"[bold yellow]Turn #{idx} — [{item.timestamp}][/bold yellow] [dim]({escape(item.project_name)})[/dim]")
+            hlog.write(f"  [bold green]❯ User Request:[/bold green] {escape(item.user_prompt)}")
             if item.plan_action == "reply" and item.direct_reply:
-                hlog.write(f"  [bold cyan]💬 Direct Answer:[/bold cyan] {item.direct_reply}")
+                hlog.write(f"  [bold cyan]💬 Direct Answer:[/bold cyan] {escape(item.direct_reply)}")
             else:
-                hlog.write(f"  [bold magenta]💡 Plan:[/bold magenta] {item.plan_reasoning}")
+                hlog.write(f"  [bold magenta]💡 Plan:[/bold magenta] {escape(item.plan_reasoning)}")
                 if item.subtasks:
                     hlog.write("  [bold white]🤖 Subagent Results:[/bold white]")
                     for s in item.subtasks:
                         status_color = "green" if s.status == "DONE" else "red"
-                        hlog.write(f"    • [{s.agent.upper()} ({s.effort})] [{status_color}]{s.status}[/{status_color}] in {s.elapsed_formatted}: {s.task_brief[:60]}")
+                        hlog.write(f"    • [bold white]{s.agent.upper()}[/bold white] [dim]({s.effort})[/dim] [{status_color}]{s.status}[/{status_color}] in {s.elapsed_formatted}: {escape(s.task_brief[:60])}")
                         if s.output_clean:
-                            preview = s.output_clean[:200].replace('\n', ' ')
+                            preview = escape(s.output_clean[:200].replace('\n', ' '))
                             hlog.write(f"      [dim]Findings:[/dim] {preview}...")
                         if s.diff_summary:
-                            hlog.write(f"      [yellow]Diff:[/yellow] {s.diff_summary}")
+                            hlog.write(f"      [yellow]Diff:[/yellow] {escape(s.diff_summary)}")
                 if item.final_synthesis:
-                    hlog.write(f"  [bold cyan]📋 Fleet Synthesis:[/bold cyan]\n{item.final_synthesis}")
+                    hlog.write(f"  [bold cyan]📋 Fleet Synthesis:[/bold cyan]\n{escape(item.final_synthesis)}")
             hlog.write("[dim]───────────────────────────────────────────────[/dim]\n")
 
     def _render_banner(self) -> str:
@@ -360,7 +362,8 @@ class SuperagentApp(App):
             # If this is the currently selected task, append to Subagent Console RichLog
             if self.active_task_id == task.task_id and task.log_lines:
                 log_widget = self.query_one("#subagent-log", RichLog)
-                log_widget.write(task.log_lines[-1])
+                line = task.log_lines[-1]
+                log_widget.write(Text.from_ansi(line) if "\x1b" in line else line)
 
         elif event == "status":
             card = self.card_widgets.get(task.task_id)
@@ -372,11 +375,11 @@ class SuperagentApp(App):
             elif task.status == "DONE":
                 feed.write(f"[bold green]✔ [{task.agent.upper()}] finished Task #{task.task_id} in [yellow]{task.elapsed_formatted}[/yellow][/bold green]")
                 if task.diff_summary:
-                    feed.write(f"[dim]  📊 Modified: {task.diff_summary}[/dim]")
+                    feed.write(f"[dim]  📊 Modified: {escape(task.diff_summary)}[/dim]")
             elif task.status == "FAILED":
                 feed.write(f"[bold red]✖ [{task.agent.upper()}] Task #{task.task_id} exited with code {task.returncode}[/bold red]")
                 if task.error_summary:
-                    feed.write(f"[red]  Error: {task.error_summary}[/red]")
+                    feed.write(f"[red]  Error: {escape(task.error_summary)}[/red]")
             elif task.status == "CANCELLED":
                 feed.write(f"[magenta]🚫 [{task.agent.upper()}] Task #{task.task_id} was cancelled by user.[/magenta]")
 
@@ -393,12 +396,12 @@ class SuperagentApp(App):
         if task:
             log_widget = self.query_one("#subagent-log", RichLog)
             log_widget.clear()
-            log_widget.write(f"[bold cyan]=== Task #{task.task_id} for {task.agent.upper()} ({task.effort.upper()} effort) ===[/bold cyan]")
-            log_widget.write(f"[dim]Project: {task.project_name} | Directory: {task.cwd}[/dim]")
-            log_widget.write(f"[bold white]Objective:[/bold white] {task.task_desc}")
-            log_widget.write("[dim]───────────────────────────────────────────────[/dim]\n")
+            log_widget.write(Text.from_markup(f"[bold cyan]=== Task #{task.task_id} for {task.agent.upper()} ({task.effort.upper()} effort) ===[/bold cyan]"))
+            log_widget.write(Text(f"Project: {task.project_name} | Directory: {task.cwd}", style="dim"))
+            log_widget.write(Text.from_markup(f"[bold white]Objective:[/bold white] {escape(task.task_desc)}"))
+            log_widget.write(Text("───────────────────────────────────────────────", style="dim"))
             for line in task.log_lines:
-                log_widget.write(line)
+                log_widget.write(Text.from_ansi(line) if "\x1b" in line else line)
 
     async def on_input_submitted(self, message: Input.Submitted) -> None:
         prompt = message.value.strip()
@@ -406,6 +409,11 @@ class SuperagentApp(App):
             return
 
         message.input.clear()
+        
+        # Ensure right pane displays the SuperAgent Feed
+        tabs = self.query_one("#main-tabs", TabbedContent)
+        tabs.active = "tab-superagent"
+
         feed = self.query_one("#superagent-feed", RichLog)
 
         # Check for commands
@@ -419,8 +427,8 @@ class SuperagentApp(App):
             feed.write("[red]Error: No active project. Register one with :add <name> <path>[/red]")
             return
 
-        # 1. Echo user prompt immediately to Feed (0ms delay)
-        feed.write(f"\n[bold green]❯ [white]You:[/white] {prompt}[/bold green]")
+        # 1. Echo user prompt immediately to Feed (0ms delay) with escape
+        feed.write(f"\n[bold green]❯ [white]You:[/white] {escape(prompt)}[/bold green]")
         feed.write("[dim]⏳ SuperAgent First Responder evaluating task...[/dim]")
 
         # 2. Process triage in a background async task so UI never freezes
@@ -435,7 +443,7 @@ class SuperagentApp(App):
         # If it's a conversational / query prompt: answer directly in the feed without subprocess!
         if decision.action == "reply":
             feed.write(f"[bold cyan]╭─── [SuperAgent Direct Reply] ─────────────────[/bold cyan]")
-            feed.write(f"[bold cyan]│[/bold cyan] [bold white]{decision.reply_text}[/bold white]")
+            feed.write(f"[bold cyan]│[/bold cyan] [bold white]{escape(decision.reply_text or '')}[/bold white]")
             feed.write(f"[bold cyan]╰───────────────────────────────────────────────[/bold cyan]\n")
 
             # Save conversational turn to history
@@ -465,10 +473,10 @@ class SuperagentApp(App):
 
         count = len(tasks)
         feed.write(f"[bold magenta]╭─── [SuperAgent Plan: Spawning {count} Subagent(s)] ───[/bold magenta]")
-        feed.write(f"[bold magenta]│[/bold magenta] 💡 [bold white]Plan:[/bold white] {decision.reasoning or 'Decomposing and launching in background.'}")
+        feed.write(f"[bold magenta]│[/bold magenta] 💡 [bold white]Plan:[/bold white] {escape(decision.reasoning or 'Decomposing and launching in background.')}")
         for idx, t in enumerate(tasks, 1):
-            feed.write(f"[bold magenta]│[/bold magenta] {idx}. [bold green][{t.agent.upper()}][/bold green] [yellow]({t.effort} effort)[/yellow]: {t.title or t.task_brief[:40]}")
-            feed.write(f"[bold magenta]│[/bold magenta]    [dim]Brief: {t.task_brief}[/dim]")
+            feed.write(f"[bold magenta]│[/bold magenta] {idx}. [bold green][{t.agent.upper()}][/bold green] [yellow]({t.effort} effort)[/yellow]: {escape(t.title or t.task_brief[:40])}")
+            feed.write(f"[bold magenta]│[/bold magenta]    [dim]Brief: {escape(t.task_brief)}[/dim]")
         feed.write(f"[bold magenta]│[/bold magenta] 🚀 [dim]Status: Workers dispatched in background.[/dim]")
         feed.write(f"[bold magenta]╰───────────────────────────────────────────────[/bold magenta]\n")
 
@@ -523,10 +531,10 @@ class SuperagentApp(App):
 
         # Output synthesis to Feed
         feed.write(f"\n[bold cyan]╭─── [SuperAgent Fleet Synthesis: Plan Completed] ───────[/bold cyan]")
-        feed.write(f"[bold cyan]│[/bold cyan] 🎯 [bold white]Original Request:[/bold white] {turn_item.user_prompt}")
+        feed.write(f"[bold cyan]│[/bold cyan] 🎯 [bold white]Original Request:[/bold white] {escape(turn_item.user_prompt)}")
         feed.write(f"[bold cyan]│[/bold cyan] 📋 [bold white]Coordinator Summary:[/bold white]")
         for sline in synthesis.splitlines():
-            feed.write(f"[bold cyan]│[/bold cyan]   {sline}")
+            feed.write(f"[bold cyan]│[/bold cyan]   {escape(sline)}")
         feed.write(f"[bold cyan]│[/bold cyan] 💡 [dim]All tasks finished. Record saved to History (Ctrl+H).[/dim]")
         feed.write(f"[bold cyan]╰───────────────────────────────────────────────────────────[/bold cyan]\n")
 

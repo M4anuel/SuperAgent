@@ -361,11 +361,22 @@ class SuperagentBrain:
             effort = "medium"
             effort_reason = "Standard reasoning effort."
 
-        # Check multi-agent intent: e.g. "spawn 2 subagents", "2 agents", "both agents", "codex and agy"
-        multi_match = re.search(r"(\d+)\s+(?:sub)?agents?", lower)
-        count = int(multi_match.group(1)) if multi_match else (
-            2 if any(w in lower for w in ("two subagents", "two agents", "both agents", "codex and agy", "agy and codex")) else 1
-        )
+        # Check multi-agent intent: e.g. "spawn 2 subagents", "2 agents", "both agents", "codex and agy", "spawn subagents"
+        multi_match = re.search(r"(\d+)\s+(?:sub)?(?:agent|worker)s?", lower)
+        word_numbers = {"two": 2, "three": 3, "four": 4, "pair of": 2}
+        count = 1
+        if multi_match:
+            count = int(multi_match.group(1))
+        else:
+            for word, n in word_numbers.items():
+                if f"{word} subagents" in lower or f"{word} agents" in lower or f"{word} workers" in lower:
+                    count = n
+                    break
+            if count == 1 and (
+                any(w in lower for w in ("both agents", "both subagents", "codex and agy", "agy and codex", "multiple subagents", "multiple agents"))
+                or re.search(r"\b(?:spawn|run|start|create|use)\s+(?:multiple\s+)?(?:sub)?agents\b", lower)
+            ):
+                count = 2
 
         # Code action verbs trigger delegation
         code_verbs = [
