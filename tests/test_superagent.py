@@ -190,7 +190,7 @@ def test_history_persistence(tmp_path):
 
 @pytest.mark.asyncio
 async def test_brain_synthesis():
-    brain = SuperagentBrain()
+    brain = SuperagentBrain(available_agents=[])
     task1 = TaskRecord("t1", "codex", "Audit backend", "p", ".", ["cmd"])
     task1.status = "DONE"
     task1.log_lines = ["Verified 15 endpoints.", "Added 2 missing input validations."]
@@ -207,8 +207,8 @@ async def test_brain_synthesis():
         project_context={"name": "p", "path": "."}
     )
     assert "Fleet Execution: 2/2" in synthesis
-    assert "[CODEX]" in synthesis
-    assert "[AGY]" in synthesis
+    assert "CODEX" in synthesis
+    assert "AGY" in synthesis
     assert "Repository changes detected" in synthesis
 
 @pytest.mark.asyncio
@@ -342,5 +342,60 @@ def test_conversation_grouping_and_resuming(tmp_path):
 
     cfg.set_last_conversation_id("myproj", conv.id)
     assert cfg.get_last_conversation_id("myproj") == conv.id
+
+def test_task_clean_output_and_ansi():
+    rec = TaskRecord(
+        task_id="t123",
+        agent="codex",
+        task_desc="Run audit",
+        project_name="proj",
+        cwd=".",
+        cmd=["codex"]
+    )
+    rec.log_lines = [
+        "OpenAI Codex v0.1.0",
+        "workdir: C:\\test",
+        "\x1b[32muser\x1b[0m",
+        "\x1b[33mcodex\x1b[0m",
+        "### Key Findings",
+        "1. Found P1 bug in session isolation",
+        "2. Found P2 issue in calendar locking",
+        "tokens used: 12345"
+    ]
+    clean = rec.clean_output
+    assert "### Key Findings" in clean
+    assert "1. Found P1 bug in session isolation" in clean
+    assert "2. Found P2 issue in calendar locking" in clean
+    assert "OpenAI Codex" not in clean
+    assert "tokens used" not in clean
+    assert "user" not in clean
+
+@pytest.mark.asyncio
+async def test_structured_synthesis_fallback_preserves_findings():
+    brain = SuperagentBrain(api_key=None, first_responder="codex", available_agents=[])
+    rec1 = TaskRecord("t1", "codex", "Backend audit", "p", ".", ["codex"], effort="high")
+    rec1.status = "DONE"
+    rec1.log_lines = [f"Improvement #{i}: file_{i}.py detail" for i in range(1, 11)]
+
+    rec2 = TaskRecord("t2", "agy", "Frontend audit", "p", ".", ["agy"], effort="high")
+    rec2.status = "DONE"
+    rec2.log_lines = [f"UI Suggestion #{i}: component_{i}.tsx detail" for i in range(1, 11)]
+
+    # Mock synthesize_results without CLI or API
+    synth = await brain.synthesize_results(
+        user_prompt="Find 10 improvements",
+        plan_reasoning="2 subagents",
+        task_records=[rec1, rec2],
+        project_context={"name": "p", "path": "."}
+    )
+
+    # Must preserve substantive findings without 280-char truncation
+    assert "CODEX" in synth
+    assert "AGY" in synth
+    assert "Improvement #1" in synth
+    assert "Improvement #10" in synth
+    assert "UI Suggestion #1" in synth
+    assert "UI Suggestion #10" in synth
+
 
 

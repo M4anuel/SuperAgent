@@ -1,11 +1,18 @@
 from __future__ import annotations
 import asyncio
 import os
+import re
 import shutil
 import time
 import uuid
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
+
+ANSI_REGEX = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]')
+
+def strip_ansi(text: str) -> str:
+    """Removes ANSI terminal escape color sequences from string."""
+    return ANSI_REGEX.sub('', text)
 
 def resolve_executable(name: str) -> List[str]:
     """Resolves CLI executable to native binary or node/powershell wrapper to avoid cmd.exe parsing errors on Windows."""
@@ -91,13 +98,16 @@ class TaskRecord:
         skip_prefixes = (
             "OpenAI Codex", "workdir:", "model:", "provider:", "approval:", "sandbox:",
             "reasoning effort:", "reasoning summaries:", "session id:", "tokens used",
-            "Reading additional input", "--------", "user", "codex", "[Superagent Error]"
+            "Reading additional input", "--------", "[Superagent Error]"
         )
         for line in self.log_lines:
-            stripped = line.strip()
-            if not stripped:
+            plain = strip_ansi(line).strip()
+            if not plain:
                 continue
-            if any(stripped.startswith(p) for p in skip_prefixes):
+            # Skip verbatim CLI role headers
+            if plain.lower() in ("user", "codex", "user:", "codex:"):
+                continue
+            if any(plain.startswith(p) for p in skip_prefixes):
                 continue
             filtered.append(line)
         return "\n".join(filtered).strip()

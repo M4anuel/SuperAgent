@@ -319,16 +319,86 @@ class SuperagentApp(App):
                             color = "green" if s.status == "DONE" else "red"
                             feed.write(f"  • [bold white][{s.agent.upper()} ({s.effort})][/bold white] [{color}]{icon} {s.status}[/{color}] in [yellow]{s.elapsed_formatted}[/yellow]: {escape(s.task_brief)}")
                             if s.output_clean:
-                                preview = " ".join(s.output_clean.splitlines()[:2])
-                                if len(preview) > 160:
-                                    preview = preview[:157] + "..."
-                                feed.write(f"[dim]    Findings: {escape(preview)}[/dim]")
+                                lines = [l for l in s.output_clean.splitlines() if l.strip()]
+                                if len(lines) <= 4 and len(s.output_clean) <= 300:
+                                    feed.write(f"[dim]    Findings: {escape(s.output_clean)}[/dim]")
+                                else:
+                                    preview = " ".join(lines[:2])
+                                    if len(preview) > 160:
+                                        preview = preview[:157] + "..."
+                                    feed.write(f"[dim]    Findings ({len(lines)} lines): {escape(preview)}[/dim]")
+                                    feed.write(f"[dim]    ↳ Select '[{s.agent.upper()}]' card on left or press Enter/Tab to inspect full report in Console.[/dim]")
                             if s.diff_summary:
                                 feed.write(f"[dim]    Modified: {escape(s.diff_summary)}[/dim]")
                     if turn.final_synthesis:
-                        feed.write(f"[bold cyan]📋 Fleet Synthesis:[/bold cyan]\n{escape(turn.final_synthesis)}\n")
+                        feed.write(f"\n[bold cyan]📋 Fleet Synthesis:[/bold cyan]\n{escape(turn.final_synthesis)}\n")
         else:
             feed.write("[dim]• Ready for instructions. Enter a task below.[/dim]\n")
+
+        self._sync_cards_from_conversation(conv)
+
+    def _sync_cards_from_conversation(self, conv: Optional[Conversation]) -> None:
+        try:
+            scroll = self.query_one("#cards-scroll", VerticalScroll)
+        except Exception:
+            return
+
+        # Keep any currently active running tasks
+        running_ids = {tid for tid, t in self.runner.tasks.items() if t.status in ("RUNNING", "TESTING", "QUEUED")}
+
+        # Remove cards that aren't running
+        for tid, card in list(self.card_widgets.items()):
+            if tid not in running_ids:
+                try:
+                    card.remove()
+                except Exception:
+                    pass
+                self.card_widgets.pop(tid, None)
+
+        # Collect subtasks from conversation turns
+        subtasks_to_show: List[SubtaskRecordData] = []
+        if conv and conv.turns:
+            for turn in conv.turns:
+                for s in turn.subtasks:
+                    subtasks_to_show.append(s)
+
+        if not subtasks_to_show and not running_ids:
+            if not self.query("#cards-empty-notice"):
+                scroll.mount(Static("[dim]No subagents running. Enter a task below.[/dim]", id="cards-empty-notice"))
+            return
+
+        empty_notice = self.query("#cards-empty-notice")
+        if empty_notice:
+            empty_notice.remove()
+
+        for s in subtasks_to_show:
+            if s.task_id not in self.runner.tasks:
+                rec = TaskRecord(
+                    task_id=s.task_id,
+                    agent=s.agent,
+                    task_desc=s.task_brief or s.title,
+                    project_name=conv.project_name if conv else "",
+                    cwd=conv.project_path if conv else "",
+                    cmd=[s.agent, s.task_brief],
+                    effort=s.effort
+                )
+                rec.status = s.status
+                rec.diff_summary = s.diff_summary
+                rec.error_summary = s.error_summary
+                if s.output_clean:
+                    rec.log_lines = s.output_clean.splitlines()
+                self.runner.tasks[s.task_id] = rec
+
+            if s.task_id not in self.card_widgets:
+                task_rec = self.runner.tasks[s.task_id]
+                card = SubagentCard(task_rec)
+                card.is_active_selection = (self.active_task_id == s.task_id)
+                self.card_widgets[s.task_id] = card
+                scroll.mount(card)
+
+        # If active_task_id is unset or not in cards, set it to the last card
+        if subtasks_to_show and (not self.active_task_id or self.active_task_id not in self.card_widgets):
+            self.select_task(subtasks_to_show[-1].task_id)
 
     def _update_active_status_bar(self) -> None:
         try:
@@ -483,14 +553,26 @@ class SuperagentApp(App):
 
         task = self.runner.tasks.get(task_id)
         if task:
-            log_widget = self.query_one("#subagent-log", RichLog)
+            try:
+                log_widget = self.query_one("#subagent-log", RichLog)
+            except Exception:
+                return
             log_widget.clear()
             log_widget.write(Text.from_markup(f"[bold cyan]=== Task #{task.task_id} for {task.agent.upper()} ({task.effort.upper()} effort) ===[/bold cyan]"))
-            log_widget.write(Text(f"Project: {task.project_name} | Directory: {task.cwd}", style="dim"))
+            log_widget.write(Text(f"Project: {task.project_name} | Directory: {task.cwd} | Status: {task.status} | Elapsed: {task.elapsed_formatted}", style="dim"))
             log_widget.write(Text.from_markup(f"[bold white]Objective:[/bold white] {escape(task.task_desc)}"))
+            if task.diff_summary:
+                log_widget.write(Text(f"Git Changes: {task.diff_summary}", style="yellow"))
+            if task.error_summary:
+                log_widget.write(Text(f"Error: {task.error_summary}", style="red"))
             log_widget.write(Text("───────────────────────────────────────────────", style="dim"))
-            for line in task.log_lines:
-                log_widget.write(Text.from_ansi(line) if "\x1b" in line else line)
+            
+            lines_to_write = task.log_lines or (task.clean_output.splitlines() if getattr(task, "clean_output", None) else [])
+            if lines_to_write:
+                for line in lines_to_write:
+                    log_widget.write(Text.from_ansi(line) if "\x1b" in line else line)
+            else:
+                log_widget.write("[dim]No output recorded for this task.[/dim]")
 
     async def on_input_submitted(self, message: Input.Submitted) -> None:
         prompt = message.value.strip()

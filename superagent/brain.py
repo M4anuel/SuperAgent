@@ -86,8 +86,8 @@ class SuperagentBrain:
         available_agents: Optional[List[str]] = None
     ):
         self.api_key = api_key or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-        self.first_responder = first_responder.lower()  # "codex" or "agy"
-        self.available_agents = [a.lower().strip() for a in (available_agents or ["codex", "agy"])]
+        self.first_responder = first_responder.lower().strip()
+        self.available_agents = [a.lower().strip() for a in available_agents] if available_agents is not None else ["codex", "agy"]
         self.client: Optional[genai.Client] = None
 
         if HAVE_GEMINI and self.api_key:
@@ -526,28 +526,36 @@ class SuperagentBrain:
         if not task_records:
             return "No subagent tasks were executed."
 
-        # If Gemini Flash is available, generate an intelligent synthesis
+        reports = []
+        for t in task_records:
+            clean = getattr(t, "clean_output", "").strip()
+            # If output is huge, extract representative substantive content (head + tail)
+            if len(clean) > 4000:
+                report_out = clean[:1200] + "\n\n[... intermediate progress omitted ...]\n\n" + clean[-2500:]
+            else:
+                report_out = clean if clean else "No output recorded."
+            diff = t.diff_summary or "No file changes detected."
+            err = t.error_summary or "None"
+            reports.append(
+                f"Subagent [{t.agent.upper()} ({t.effort} effort)] - Status: {t.status} ({t.elapsed_formatted})\n"
+                f"Objective: {t.task_desc}\n"
+                f"Output / Findings:\n{report_out}\n"
+                f"Modified Files: {diff}\n"
+                f"Errors: {err}"
+            )
+        reports_joined = "\n\n---\n\n".join(reports)
+
+        # 1. If Gemini Flash API is available, generate an intelligent synthesis
         if self.client:
             try:
-                reports = []
-                for t in task_records:
-                    out = t.clean_output[:1000] if getattr(t, "clean_output", None) else "No output."
-                    diff = t.diff_summary or "No file changes detected."
-                    reports.append(
-                        f"Subagent [{t.agent.upper()} ({t.effort} effort)] - Status: {t.status} ({t.elapsed_formatted})\n"
-                        f"Brief: {t.task_desc}\n"
-                        f"Output: {out}\n"
-                        f"Modified Files: {diff}"
-                    )
-                reports_joined = "\n\n".join(reports)
                 prompt = (
                     f"User Prompt: {user_prompt}\n"
                     f"Initial Plan: {plan_reasoning}\n\n"
                     f"Subagent Reports:\n{reports_joined}\n\n"
-                    "Synthesize the work done by the fleet. Provide:\n"
-                    "1. A concise overview of what was accomplished.\n"
-                    "2. Key insights or conclusions from each subagent.\n"
-                    "3. Any modified files or next steps for the user."
+                    "Synthesize the work done by the fleet into a comprehensive coordinator report addressing the user's prompt. Provide:\n"
+                    "1. Executive Summary & Answer: Fulfill the user's specific request directly (e.g. if they asked for a compiled list, merge and deduplicate findings into that list).\n"
+                    "2. Subagent Contributions: Key findings or code produced by each subagent.\n"
+                    "3. Any modified files, git status, and recommended next steps."
                 )
                 response = self.client.models.generate_content(
                     model="gemini-2.5-flash",
@@ -561,33 +569,103 @@ class SuperagentBrain:
             except Exception:
                 pass
 
-        # Structured synthesis (instant, reliable, no external API needed)
+        # 2. Subscription Mode: Use the First Responder CLI (agy or codex) to synthesize
+        cwd = project_context.get("path") or os.getcwd()
+        cli_agent = self.first_responder if self.first_responder in self.available_agents else (self.available_agents[0] if self.available_agents else None)
+        if cli_agent:
+            try:
+                from superagent.runner import resolve_executable, strip_ansi
+                synthesis_prompt = (
+                    "You are the SuperAgent Fleet Coordinator.\n"
+                    f"User Request: {user_prompt}\n\n"
+                    f"Subagent Reports:\n{reports_joined}\n\n"
+                    "Instructions:\n"
+                    "- Address the user's request thoroughly using the subagents' outputs.\n"
+                    "- If the user asked for a compiled or unified list (such as top 10 improvements or recommendations), compile, merge, and deduplicate findings into that unified list.\n"
+                    "- Summarize what each subagent accomplished.\n"
+                    "- Highlight any modified files or next steps.\n"
+                    "Output your report directly in clean Markdown without conversational preamble."
+                )
+                if cli_agent == "agy":
+                    exec_prefix = resolve_executable("agy")
+                    cmd = exec_prefix + ["--dangerously-skip-permissions", "--effort", "low", "-p", synthesis_prompt]
+                else:
+                    exec_prefix = resolve_executable("codex")
+                    cmd = exec_prefix + [
+                        "exec",
+                        "--skip-git-repo-check",
+                        "--dangerously-bypass-approvals-and-sandbox",
+                        "-c", 'model_reasoning_effort="low"',
+                        "-C", cwd,
+                        synthesis_prompt
+                    ]
+
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    cwd=cwd,
+                    stdin=asyncio.subprocess.DEVNULL,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT
+                )
+                stdout_bytes, _ = await asyncio.wait_for(proc.communicate(), timeout=45.0)
+                output = stdout_bytes.decode("utf-8", errors="replace").strip()
+                from superagent.runner import strip_ansi
+                raw_lines = [strip_ansi(l) for l in output.splitlines()]
+
+                # If output contains a 'codex' turn marker, take content after the last marker
+                codex_idx = -1
+                for idx, line in enumerate(raw_lines):
+                    if line.strip().lower() in ("codex", "codex:"):
+                        codex_idx = idx
+
+                if codex_idx != -1 and codex_idx + 1 < len(raw_lines):
+                    candidate_lines = raw_lines[codex_idx + 1:]
+                else:
+                    candidate_lines = raw_lines
+
+                skip_cli_prefixes = (
+                    "OpenAI Codex", "workdir:", "model:", "provider:", "approval:", "sandbox:",
+                    "reasoning effort:", "reasoning summaries:", "session id:", "tokens used",
+                    "Reading additional input", "--------", "You are the SuperAgent Fleet Coordinator."
+                )
+                cleaned_lines = [
+                    l for l in candidate_lines
+                    if l.strip() and not any(l.strip().startswith(p) for p in skip_cli_prefixes)
+                    and l.strip().lower() not in ("user", "codex")
+                ]
+                if cleaned_lines:
+                    result = "\n".join(cleaned_lines).strip()
+                    if len(result) > 40:
+                        successful = sum(1 for t in task_records if t.status == "DONE")
+                        total = len(task_records)
+                        header = f"• Fleet Execution: {successful}/{total} subagent task(s) completed successfully.\n\n"
+                        return header + result
+            except Exception:
+                pass
+
+        # 3. Structured synthesis fallback (never truncates findings)
         lines: List[str] = []
         successful = sum(1 for t in task_records if t.status == "DONE")
         total = len(task_records)
-        lines.append(f"• Fleet Execution: {successful}/{total} subagent task(s) completed successfully.")
-        
+        lines.append(f"• Fleet Execution: {successful}/{total} subagent task(s) completed successfully.\n")
+
         for t in task_records:
             status_icon = "✔" if t.status == "DONE" else "✖"
-            header = f"• [{t.agent.upper()}] ({t.effort} effort, {t.elapsed_formatted}) {status_icon} {t.status}:"
-            lines.append(header)
-            
+            lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+            lines.append(f"📌 [{t.agent.upper()}] ({t.effort} effort, {t.elapsed_formatted}) {status_icon} {t.status}")
+            lines.append(f"Objective: {t.task_desc}")
+            if getattr(t, "diff_summary", None):
+                lines.append(f"Modified: {t.diff_summary}")
+            if getattr(t, "error_summary", None):
+                lines.append(f"Error: {t.error_summary}")
             clean = getattr(t, "clean_output", "").strip()
             if clean:
-                preview_lines = [l.strip() for l in clean.splitlines() if l.strip()]
-                preview = " ".join(preview_lines[:3])
-                if len(preview) > 280:
-                    preview = preview[:277] + "..."
-                lines.append(f"  Findings: {preview}")
-            else:
-                lines.append(f"  Task '{t.task_desc}' finished.")
-
-            if getattr(t, "diff_summary", None):
-                lines.append(f"  Modified: {t.diff_summary}")
+                lines.append(f"\nFindings & Deliverables:\n{clean}")
+            lines.append("")
 
         if any(getattr(t, "diff_summary", None) for t in task_records):
             lines.append("• Repository changes detected. Review git status or switch to Subagent Console for details.")
         else:
             lines.append("• Analysis complete. No repository file changes were committed.")
 
-        return "\n".join(lines)
+        return "\n".join(lines).strip()
