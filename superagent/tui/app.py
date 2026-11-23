@@ -9,14 +9,15 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Container, Horizontal, Vertical, VerticalScroll
 from textual.message import Message
-from textual.widgets import Footer, Header, Input, Label, RichLog, Static, TabbedContent, TabPane
+from textual.widgets import Footer, Header, Input, Label, RichLog, Static, TabbedContent, TabPane, OptionList
+from textual.widgets.option_list import Option
 from rich.markup import escape
 from rich.text import Text
 
 from superagent.brain import SuperagentBrain
 from superagent.config import SuperagentConfig, ProjectConfig
 from superagent.git_utils import GitManager
-from superagent.history import HistoryManager, HistoryItem, SubtaskRecordData
+from superagent.history import HistoryManager, HistoryItem, Conversation, SubtaskRecordData
 from superagent.runner import SubagentRunner, TaskRecord
 from superagent.tui.cards import SubagentCard, THROBBER_FRAMES
 
@@ -82,10 +83,30 @@ RichLog {
     overflow-x: hidden;
 }
 
-#superagent-feed, #subagent-log, #history-log {
+#superagent-feed, #subagent-log {
     height: 1fr;
     padding: 0 1;
     overflow-x: hidden;
+}
+
+#history-header {
+    dock: top;
+    height: 1;
+    background: $surface-darken-1;
+    color: $accent;
+    text-style: bold;
+    padding: 0 1;
+}
+
+#history-conversations-list {
+    height: 1fr;
+    border: none;
+    padding: 0 1;
+    overflow-x: hidden;
+}
+
+#history-conversations-list:focus {
+    border: none;
 }
 
 #feed-status-bar {
@@ -182,7 +203,7 @@ class SuperagentApp(App):
         tabs.active = "tab-history"
         self.refresh_history_tab()
 
-    def __init__(self, initial_project: Optional[str] = None):
+    def __init__(self, initial_project: Optional[str] = None, start_new_conversation: bool = False):
         super().__init__()
         self.cfg = SuperagentConfig()
         if initial_project:
@@ -197,6 +218,8 @@ class SuperagentApp(App):
         self.active_task_id: Optional[str] = None
         self.card_widgets: Dict[str, SubagentCard] = {}
         self._status_frame_idx = 0
+        self.start_new_conversation_flag = start_new_conversation
+        self.current_conversation: Optional[Conversation] = None
         
         # Subscribe runner events to threadsafe UI callbacks
         self.runner.subscribe(self._dispatch_runner_callback)
@@ -224,7 +247,8 @@ class SuperagentApp(App):
                     with TabPane("💻 Subagent Console", id="tab-console"):
                         yield RichLog(id="subagent-log", highlight=False, markup=False, wrap=True)
                     with TabPane("📜 History", id="tab-history"):
-                        yield RichLog(id="history-log", highlight=True, markup=True, wrap=True)
+                        yield Label("📜 CONVERSATION HISTORY  •  Select with ↑/↓ and press ENTER to resume in Feed", id="history-header")
+                        yield OptionList(id="history-conversations-list")
 
         with Container(id="input-container"):
             yield Input(
@@ -235,7 +259,33 @@ class SuperagentApp(App):
         yield Footer()
 
     def on_mount(self) -> None:
+        active_proj = self.cfg.active_project
+        if active_proj:
+            if self.start_new_conversation_flag:
+                self.current_conversation = self.history.create_conversation(active_proj.name, active_proj.path)
+            else:
+                last_id = self.cfg.get_last_conversation_id(active_proj.name)
+                conv = self.history.get_conversation(last_id) if last_id else None
+                if not conv:
+                    existing = self.history.list_conversations(active_proj.name)
+                    conv = existing[0] if existing else None
+                if not conv:
+                    conv = self.history.create_conversation(active_proj.name, active_proj.path)
+                self.current_conversation = conv
+            self.cfg.set_last_conversation_id(active_proj.name, self.current_conversation.id)
+
+        self._render_conversation_in_feed(self.current_conversation)
+        self.refresh_history_tab()
+
+        # In-place status bar throbber update (replaces periodic milestone spam in feed)
+        self.set_interval(0.25, self._update_active_status_bar)
+
+        # Focus input
+        self.query_one("#prompt-input", Input).focus()
+
+    def _render_conversation_in_feed(self, conv: Optional[Conversation]) -> None:
         feed = self.query_one("#superagent-feed", RichLog)
+        feed.clear()
         feed.write("[bold cyan]───────────────────────────────────────────────[/bold cyan]")
         feed.write("[bold white]🤖 SuperAgent Fleet Coordinator Online[/bold white]")
         active_proj = self.cfg.active_project
@@ -244,15 +294,41 @@ class SuperagentApp(App):
         active_agents = ", ".join(a.upper() for a in self.cfg.get_enabled_agents())
         feed.write(f"[dim]• Active Fleet: [/dim][bold green]{active_agents}[/bold green]  [dim]| Default: [/dim][bold cyan]{agent}[/bold cyan]  [dim]| Project: [/dim][bold cyan]{pname}[/bold cyan]")
         feed.write(f"[bold green]• 🧠 First Responder Brain:[/bold green] [bold cyan]{self.brain.mode_description}[/bold cyan]")
-        feed.write("[dim]• Direct answers for questions. Autonomous delegation for coding tasks.[/dim]")
-        feed.write("[dim]• Press Ctrl+H for History. Console tab shows raw subagent logs.[/dim]")
-        feed.write("[bold cyan]───────────────────────────────────────────────[/bold cyan]\n")
         
-        # In-place status bar throbber update (replaces periodic milestone spam in feed)
-        self.set_interval(0.25, self._update_active_status_bar)
+        if conv:
+            turn_label = f"{conv.turn_count} turn(s)" if conv.turn_count > 0 else "new"
+            feed.write(f"[bold yellow]• 💬 Active Conversation:[/bold yellow] [bold white]{escape(conv.title)}[/bold white] [dim]({turn_label}, {conv.id})[/dim]")
+        
+        feed.write("[dim]• Direct answers for questions. Autonomous delegation for coding tasks.[/dim]")
+        feed.write("[dim]• Type ':new [name]' to start a new chat. Press Ctrl+H to browse conversation history.[/dim]")
+        feed.write("[bold cyan]───────────────────────────────────────────────[/bold cyan]\n")
 
-        # Focus input
-        self.query_one("#prompt-input", Input).focus()
+        if conv and conv.turns:
+            for turn in conv.turns:
+                feed.write(f"\n[bold green]❯ [white]You:[/white] {escape(turn.user_prompt)}[/bold green]")
+                if turn.plan_action == "reply" and turn.direct_reply:
+                    feed.write(f"[bold cyan]╭─── [SuperAgent Direct Reply] ─────────────────[/bold cyan]")
+                    feed.write(f"[bold cyan]│[/bold cyan] [bold white]{escape(turn.direct_reply)}[/bold white]")
+                    feed.write(f"[bold cyan]╰───────────────────────────────────────────────[/bold cyan]\n")
+                elif turn.plan_action == "delegate":
+                    if turn.plan_reasoning:
+                        feed.write(f"[bold magenta]💡 Plan:[/bold magenta] {escape(turn.plan_reasoning)}")
+                    if turn.subtasks:
+                        for s in turn.subtasks:
+                            icon = "✔" if s.status == "DONE" else ("✖" if s.status == "FAILED" else "⚡")
+                            color = "green" if s.status == "DONE" else "red"
+                            feed.write(f"  • [bold white][{s.agent.upper()} ({s.effort})][/bold white] [{color}]{icon} {s.status}[/{color}] in [yellow]{s.elapsed_formatted}[/yellow]: {escape(s.task_brief)}")
+                            if s.output_clean:
+                                preview = " ".join(s.output_clean.splitlines()[:2])
+                                if len(preview) > 160:
+                                    preview = preview[:157] + "..."
+                                feed.write(f"[dim]    Findings: {escape(preview)}[/dim]")
+                            if s.diff_summary:
+                                feed.write(f"[dim]    Modified: {escape(s.diff_summary)}[/dim]")
+                    if turn.final_synthesis:
+                        feed.write(f"[bold cyan]📋 Fleet Synthesis:[/bold cyan]\n{escape(turn.final_synthesis)}\n")
+        else:
+            feed.write("[dim]• Ready for instructions. Enter a task below.[/dim]\n")
 
     def _update_active_status_bar(self) -> None:
         try:
@@ -271,43 +347,49 @@ class SuperagentApp(App):
 
     def refresh_history_tab(self) -> None:
         try:
-            hlog = self.query_one("#history-log", RichLog)
+            opt_list = self.query_one("#history-conversations-list", OptionList)
         except Exception:
             return
 
-        hlog.clear()
-        hlog.write("[bold cyan]───────────────────────────────────────────────[/bold cyan]")
-        hlog.write("[bold white]📜 SuperAgent Conversation & Task History[/bold white]")
-        hlog.write("[dim]Stored records of requests, plans, subagent outputs, and syntheses.[/dim]")
-        hlog.write("[bold cyan]───────────────────────────────────────────────[/bold cyan]\n")
-
+        opt_list.clear_options()
         active_proj = self.cfg.active_project
         pname = active_proj.name if active_proj else None
-        turns = self.history.list_turns(project_name=pname, limit=30)
-        if not turns:
-            hlog.write("[dim]No historical conversations recorded yet for this project.[/dim]\n")
+        convs = self.history.list_conversations(project_name=pname, limit=50)
+
+        if not convs:
+            opt_list.add_option(Option("[dim]No saved conversations yet for this project. Type ':new' to start one.[/dim]", disabled=True))
             return
 
-        for idx, item in enumerate(turns, 1):
-            hlog.write(f"[bold yellow]Turn #{idx} — [{item.timestamp}][/bold yellow] [dim]({escape(item.project_name)})[/dim]")
-            hlog.write(f"  [bold green]❯ User Request:[/bold green] {escape(item.user_prompt)}")
-            if item.plan_action == "reply" and item.direct_reply:
-                hlog.write(f"  [bold cyan]💬 Direct Answer:[/bold cyan] {escape(item.direct_reply)}")
-            else:
-                hlog.write(f"  [bold magenta]💡 Plan:[/bold magenta] {escape(item.plan_reasoning)}")
-                if item.subtasks:
-                    hlog.write("  [bold white]🤖 Subagent Results:[/bold white]")
-                    for s in item.subtasks:
-                        status_color = "green" if s.status == "DONE" else "red"
-                        hlog.write(f"    • [bold white]{s.agent.upper()}[/bold white] [dim]({s.effort})[/dim] [{status_color}]{s.status}[/{status_color}] in {s.elapsed_formatted}: {escape(s.task_brief[:60])}")
-                        if s.output_clean:
-                            preview = escape(s.output_clean[:200].replace('\n', ' '))
-                            hlog.write(f"      [dim]Findings:[/dim] {preview}...")
-                        if s.diff_summary:
-                            hlog.write(f"      [yellow]Diff:[/yellow] {escape(s.diff_summary)}")
-                if item.final_synthesis:
-                    hlog.write(f"  [bold cyan]📋 Fleet Synthesis:[/bold cyan]\n{escape(item.final_synthesis)}")
-            hlog.write("[dim]───────────────────────────────────────────────[/dim]\n")
+        curr_id = self.current_conversation.id if self.current_conversation else None
+        for c in convs:
+            is_active = (c.id == curr_id)
+            marker = "▶ " if is_active else "  "
+            active_style = "bold green" if is_active else "bold white"
+            snippet = escape(c.last_snippet)
+            label = (
+                f"{marker}[{active_style}]{escape(c.title)}[/{active_style}]  "
+                f"[dim]• {c.turn_count} turn(s) • {c.updated_at}[/dim]\n"
+                f"    [dim]Last: {snippet}[/dim]"
+            )
+            opt_list.add_option(Option(label, id=c.id))
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        if not event.option_id:
+            return
+        conv_id = str(event.option_id)
+        conv = self.history.get_conversation(conv_id)
+        if conv:
+            self.current_conversation = conv
+            proj = self.cfg.active_project
+            if proj:
+                self.cfg.set_last_conversation_id(proj.name, conv.id)
+            self._render_conversation_in_feed(conv)
+            tabs = self.query_one("#main-tabs", TabbedContent)
+            tabs.active = "tab-superagent"
+            feed = self.query_one("#superagent-feed", RichLog)
+            feed.write(f"[bold green]✔ Resumed conversation '{escape(conv.title)}' ({conv.turn_count} turn(s))[/bold green]\n")
+            self.query_one("#prompt-input", Input).focus()
+            self.refresh_history_tab()
 
     def _render_banner(self) -> str:
         proj = self.cfg.active_project
@@ -467,7 +549,11 @@ class SuperagentApp(App):
                 plan_reasoning=decision.reasoning or "Direct response",
                 direct_reply=decision.reply_text
             )
-            self.history.save_turn(item)
+            if not self.current_conversation:
+                self.current_conversation = self.history.create_conversation(proj.name, proj.path)
+                self.cfg.set_last_conversation_id(proj.name, self.current_conversation.id)
+            self.current_conversation = self.history.add_turn_to_conversation(self.current_conversation.id, item)
+            self.refresh_history_tab()
             return
 
         # Multi-task or single-task delegation
@@ -563,7 +649,11 @@ class SuperagentApp(App):
                 error_summary=t.error_summary
             ))
         turn_item.final_synthesis = synthesis
-        self.history.save_turn(turn_item)
+        if not self.current_conversation:
+            self.current_conversation = self.history.create_conversation(proj.name, proj.path)
+            self.cfg.set_last_conversation_id(proj.name, self.current_conversation.id)
+        self.current_conversation = self.history.add_turn_to_conversation(self.current_conversation.id, turn_item)
+        self.refresh_history_tab()
 
     async def _handle_command(self, cmd_line: str) -> None:
         feed = self.query_one("#superagent-feed", RichLog)
@@ -580,11 +670,31 @@ class SuperagentApp(App):
                 feed.write("[dim]Tip: Switch with :p <name> or press Ctrl+P[/dim]\n")
             else:
                 target = parts[1]
-                if self.cfg.set_active_project(target):
-                    feed.write(f"[bold green]Switched active project to:[/bold green] {target}")
-                    self.update_banner()
-                else:
+                if not self.switch_to_project(target):
                     feed.write(f"[bold red]Project '{target}' not found. Use :projects to list.[/bold red]")
+
+        elif cmd in (":new", ":n"):
+            title = " ".join(parts[1:]).strip() if len(parts) > 1 else None
+            proj = self.cfg.active_project
+            if not proj:
+                feed.write("[red]No active project selected.[/red]")
+                return
+            new_conv = self.history.create_conversation(proj.name, proj.path, title=title)
+            self.current_conversation = new_conv
+            self.cfg.set_last_conversation_id(proj.name, new_conv.id)
+            self._render_conversation_in_feed(new_conv)
+            feed.write(f"[bold green]✔ Started new conversation: '{escape(new_conv.title)}'[/bold green]\n")
+            self.refresh_history_tab()
+
+        elif cmd == ":title" and len(parts) > 1:
+            new_title = " ".join(parts[1:]).strip()
+            if self.current_conversation:
+                self.current_conversation.title = new_title
+                self.history.save_conversation(self.current_conversation)
+                feed.write(f"[bold green]✔ Conversation renamed to: '{escape(new_title)}'[/bold green]\n")
+                self.refresh_history_tab()
+            else:
+                feed.write("[yellow]No active conversation to rename.[/yellow]\n")
 
         elif cmd == ":add" and len(parts) >= 3:
             name = parts[1]
@@ -649,21 +759,23 @@ class SuperagentApp(App):
 
         elif cmd == ":help":
             feed.write("\n[bold cyan]SuperAgent Commands:[/bold cyan]")
-            feed.write("  @codex <task>      - Delegate task to OpenAI Codex CLI")
-            feed.write("  @agy <task>        - Delegate task to Google Antigravity CLI")
-            feed.write("  @claude <task>     - Delegate task to Anthropic Claude Code (if enabled)")
+            feed.write("  :new [title] (or :n)- Start a new conversation for this project")
+            feed.write("  :title <name>      - Rename the active conversation")
+            feed.write("  :history (or :h)   - Switch to History tab (or Ctrl+H)")
+            feed.write("  :p <name>          - Switch active project (resumes its last conversation)")
+            feed.write("  :projects          - List all configured projects")
+            feed.write("  :add <name> <path> - Register a new project repository")
             feed.write("  :agents            - View fleet agents & subscription status")
             feed.write("  :agent enable <ag> - Enable an agent (e.g. :agent enable codex)")
             feed.write("  :agent disable <ag>- Disable an agent (e.g. :agent disable claude)")
-            feed.write("  :history (or :h)   - View conversation & task history (or Ctrl+H)")
             feed.write("  :key <api-key>     - Set Gemini API key for integrated brain")
-            feed.write("  :projects          - List all configured projects")
-            feed.write("  :p <name>          - Switch active project (or Ctrl+P)")
-            feed.write("  :add <name> <path> - Register a new project repository")
             feed.write("  :cancel [id]       - Cancel task (or Ctrl+K)")
             feed.write("  :clear             - Remove finished/failed cards (or Ctrl+L)")
-            feed.write("  Ctrl+H             - Switch to History tab")
-            feed.write("  Ctrl+Y             - Copy entire log to clipboard")
+            feed.write("  @codex <task>      - Explicitly delegate task to OpenAI Codex CLI")
+            feed.write("  @agy <task>        - Explicitly delegate task to Google Antigravity CLI")
+            feed.write("  Ctrl+H             - Switch to History tab (Enter on a conversation to resume)")
+            feed.write("  Ctrl+P             - Cycle active project (auto-resumes last conversation)")
+            feed.write("  Ctrl+Y             - Copy active log to clipboard")
             feed.write("  Ctrl+Q             - Exit SuperAgent")
             feed.write("[dim]Note: Conversational prompts answer directly. Coding tasks delegate with adaptive effort.[/dim]\n")
         else:
@@ -692,6 +804,30 @@ class SuperagentApp(App):
         for tid in list(self.runner.tasks.keys()):
             self.runner.cancel_task(tid)
 
+    def switch_to_project(self, project_name: str) -> bool:
+        if self.cfg.set_active_project(project_name):
+            proj = self.cfg.active_project
+            if not proj:
+                return True
+            self.update_banner()
+
+            # Switch to last conversation for this project
+            last_id = self.cfg.get_last_conversation_id(proj.name)
+            conv = self.history.get_conversation(last_id) if last_id else None
+            if not conv:
+                convs = self.history.list_conversations(proj.name)
+                conv = convs[0] if convs else None
+            if not conv:
+                conv = self.history.create_conversation(proj.name, proj.path)
+            self.current_conversation = conv
+            self.cfg.set_last_conversation_id(proj.name, conv.id)
+            self._render_conversation_in_feed(conv)
+            self.refresh_history_tab()
+            feed = self.query_one("#superagent-feed", RichLog)
+            feed.write(f"[bold cyan]Switched active project to:[/bold cyan] {proj.name} [dim](resumed: {escape(conv.title)})[/dim]\n")
+            return True
+        return False
+
     def action_switch_project_dialog(self) -> None:
         # Toggle or cycle through registered projects
         projects = self.cfg.list_projects()
@@ -705,7 +841,4 @@ class SuperagentApp(App):
                     curr_idx = idx
                     break
         next_proj = projects[(curr_idx + 1) % len(projects)]
-        self.cfg.set_active_project(next_proj.name)
-        self.update_banner()
-        feed = self.query_one("#superagent-feed", RichLog)
-        feed.write(f"[bold cyan]Switched active project to:[/bold cyan] {next_proj.name}")
+        self.switch_to_project(next_proj.name)

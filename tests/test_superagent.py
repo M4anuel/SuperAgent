@@ -291,3 +291,56 @@ async def test_dynamic_planning_decomposition():
     assert tasks[0] == ("codex", "high", "Deep audit of session management and SQLite locks")
     assert tasks[1] == ("agy", "medium", "Verify React component responsive layouts and dark mode")
 
+def test_conversation_grouping_and_resuming(tmp_path):
+    from superagent.history import HistoryManager, HistoryItem, Conversation
+    from superagent.config import SuperagentConfig
+
+    hm = HistoryManager(base_dir=tmp_path)
+    
+    # 1. Create a conversation
+    conv = hm.create_conversation("myproj", str(tmp_path), title="Initial Chat")
+    assert conv.title == "Initial Chat"
+    assert conv.project_name == "myproj"
+    assert conv.turn_count == 0
+
+    # 2. Add turn
+    turn1 = HistoryItem(
+        id="turn_1",
+        project_name="myproj",
+        project_path=str(tmp_path),
+        user_prompt="Add dark mode support",
+        plan_action="reply",
+        direct_reply="Dark mode enabled."
+    )
+    conv = hm.add_turn_to_conversation(conv.id, turn1)
+    assert conv.turn_count == 1
+    assert "Add dark mode" in conv.last_snippet
+
+    # 3. Create second conversation with auto-title from first turn
+    conv2 = hm.create_conversation("myproj", str(tmp_path))
+    turn2 = HistoryItem(
+        id="turn_2",
+        project_name="myproj",
+        project_path=str(tmp_path),
+        user_prompt="Fix database deadlock in sqlite wrapper",
+        plan_action="reply",
+        direct_reply="Fixed."
+    )
+    conv2 = hm.add_turn_to_conversation(conv2.id, turn2)
+    assert conv2.title.startswith("Fix database deadlock")
+    assert conv2.turn_count == 1
+
+    # 4. List conversations
+    convs = hm.list_conversations("myproj")
+    assert len(convs) == 2
+
+    # 5. Config last_conversation tracking
+    cfg = SuperagentConfig()
+    cfg.config_dir = tmp_path
+    cfg.config_file = tmp_path / "config.json"
+    cfg._data = {"projects": {}, "active_project": "myproj", "last_conversations": {}}
+
+    cfg.set_last_conversation_id("myproj", conv.id)
+    assert cfg.get_last_conversation_id("myproj") == conv.id
+
+

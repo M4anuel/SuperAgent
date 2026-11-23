@@ -13,11 +13,13 @@ def main() -> None:
         prog="superagent",
         description="SuperAgent: Coordinate Claude Code, Codex, and Antigravity across multiple projects."
     )
+    parser.add_argument("-n", "--new", action="store_true", help="Start a new conversation session")
     subparsers = parser.add_subparsers(dest="subcommand", help="Subcommand to execute")
 
     # tui subcommand
     tui_parser = subparsers.add_parser("tui", help="Launch interactive Terminal UI dashboard")
     tui_parser.add_argument("project", nargs="?", help="Project name to focus on initially")
+    tui_parser.add_argument("-n", "--new", action="store_true", help="Start a new conversation session")
 
     # run subcommand (headless)
     run_parser = subparsers.add_parser("run", help="Run a task non-interactively via a subagent")
@@ -52,8 +54,9 @@ def main() -> None:
             if detected:
                 target_project = detected.name
 
+        start_new = bool(getattr(args, "new", False))
         from superagent.tui.app import SuperagentApp
-        app = SuperagentApp(initial_project=target_project)
+        app = SuperagentApp(initial_project=target_project, start_new_conversation=start_new)
         app.run()
         return
 

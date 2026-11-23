@@ -112,6 +112,13 @@ class SuperagentConfig:
             return True
         return False
 
+    def get_last_conversation_id(self, project_name: str) -> Optional[str]:
+        return self._data.get("last_conversations", {}).get(project_name.lower())
+
+    def set_last_conversation_id(self, project_name: str, conv_id: str) -> None:
+        self._data.setdefault("last_conversations", {})[project_name.lower()] = conv_id
+        self.save()
+
     @property
     def active_project(self) -> Optional[ProjectConfig]:
         pname = self._data.get("active_project")
