@@ -1,7 +1,9 @@
 from __future__ import annotations
 import asyncio
 from pathlib import Path
-from typing import Dict, Optional
+import time
+from typing import Dict, List, Optional
+import uuid
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -12,8 +14,9 @@ from textual.widgets import Footer, Header, Input, Label, RichLog, Static, Tabbe
 from superagent.brain import SuperagentBrain
 from superagent.config import SuperagentConfig, ProjectConfig
 from superagent.git_utils import GitManager
+from superagent.history import HistoryManager, HistoryItem, SubtaskRecordData
 from superagent.runner import SubagentRunner, TaskRecord
-from superagent.tui.cards import SubagentCard
+from superagent.tui.cards import SubagentCard, THROBBER_FRAMES
 
 APP_CSS = """
 Screen {
@@ -61,20 +64,38 @@ Screen {
     height: 100%;
     margin-left: 1;
     padding: 0;
+    overflow-x: hidden;
 }
 
 #main-tabs {
     height: 100%;
+    overflow-x: hidden;
 }
 
-#superagent-feed {
-    height: 1fr;
-    padding: 0 1;
+TabPane {
+    height: 100%;
+    padding: 0;
+    overflow-x: hidden;
 }
 
-#subagent-log {
+RichLog {
+    overflow-x: hidden;
+}
+
+#superagent-feed, #subagent-log, #history-log {
     height: 1fr;
     padding: 0 1;
+    overflow-x: hidden;
+}
+
+#feed-status-bar {
+    dock: bottom;
+    height: 1;
+    background: $surface-darken-1;
+    color: $accent;
+    padding: 0 1;
+    text-style: italic;
+    overflow-x: hidden;
 }
 
 #input-container {
@@ -116,6 +137,7 @@ class SuperagentApp(App):
     BINDINGS = [
         Binding("ctrl+q", "quit", "Quit", show=True),
         Binding("ctrl+p", "switch_project_dialog", "Projects", show=True),
+        Binding("ctrl+h", "view_history", "History", show=True),
         Binding("ctrl+k", "cancel_active", "Cancel Task", show=True),
         Binding("ctrl+l", "clear_finished", "Clear Done", show=True),
         Binding("ctrl+y", "copy_active_log", "Copy Log", show=True),
@@ -155,6 +177,11 @@ class SuperagentApp(App):
         else:
             self.notify("No active task log to copy.", title="Clipboard", severity="warning")
 
+    def action_view_history(self) -> None:
+        tabs = self.query_one("#main-tabs", TabbedContent)
+        tabs.active = "tab-history"
+        self.refresh_history_tab()
+
     def __init__(self, initial_project: Optional[str] = None):
         super().__init__()
         self.cfg = SuperagentConfig()
@@ -164,9 +191,11 @@ class SuperagentApp(App):
             api_key=self.cfg.gemini_api_key,
             first_responder=self.cfg.first_responder
         )
+        self.history = HistoryManager()
         self.runner = SubagentRunner()
         self.active_task_id: Optional[str] = None
         self.card_widgets: Dict[str, SubagentCard] = {}
+        self._status_frame_idx = 0
         
         # Subscribe runner events to threadsafe UI callbacks
         self.runner.subscribe(self._dispatch_runner_callback)
@@ -185,13 +214,16 @@ class SuperagentApp(App):
                 with VerticalScroll(id="cards-scroll"):
                     yield Static("[dim]No subagents running. Enter a task below.[/dim]", id="cards-empty-notice")
             
-            # Right pane: tabbed feed and console
+            # Right pane: tabbed feed, console, and history
             with Vertical(id="log-pane"):
                 with TabbedContent(id="main-tabs"):
                     with TabPane("🤖 SuperAgent Feed", id="tab-superagent"):
                         yield RichLog(id="superagent-feed", highlight=True, markup=True, wrap=True)
+                        yield Static("[dim]⚡ Fleet idle • Standing by for next instruction[/dim]", id="feed-status-bar")
                     with TabPane("💻 Subagent Console", id="tab-console"):
                         yield RichLog(id="subagent-log", highlight=True, markup=True, wrap=True)
+                    with TabPane("📜 History", id="tab-history"):
+                        yield RichLog(id="history-log", highlight=True, markup=True, wrap=True)
 
         with Container(id="input-container"):
             yield Input(
@@ -203,28 +235,77 @@ class SuperagentApp(App):
 
     def on_mount(self) -> None:
         feed = self.query_one("#superagent-feed", RichLog)
-        feed.write("[bold cyan]═════════════════════════════════════════════════════════════════════[/bold cyan]")
+        feed.write("[bold cyan]───────────────────────────────────────────────[/bold cyan]")
         feed.write("[bold white]🤖 SuperAgent Fleet Coordinator Online[/bold white]")
         active_proj = self.cfg.active_project
         pname = active_proj.name if active_proj else "None"
         agent = active_proj.default_agent.upper() if active_proj else "CODEX"
         feed.write(f"[dim]• Default Subagent: [/dim][bold green]{agent} CLI[/bold green]  [dim]| Active Project: [/dim][bold cyan]{pname}[/bold cyan]")
         feed.write(f"[bold green]• 🧠 First Responder Brain:[/bold green] [bold cyan]{self.brain.mode_description}[/bold cyan]")
-        feed.write("[dim]• Conversational prompts answer directly. Coding tasks delegate with adaptive effort.[/dim]")
-        feed.write("[dim]• Switch to 'Subagent Console' tab anytime to inspect live raw CLI output.[/dim]")
-        feed.write("[bold cyan]═════════════════════════════════════════════════════════════════════[/bold cyan]\n")
+        feed.write("[dim]• Direct answers for questions. Autonomous delegation for coding tasks.[/dim]")
+        feed.write("[dim]• Press Ctrl+H for History. Console tab shows raw subagent logs.[/dim]")
+        feed.write("[bold cyan]───────────────────────────────────────────────[/bold cyan]\n")
         
-        # Start milestone check every 20 seconds
-        self.set_interval(20.0, self._check_running_milestones)
+        # In-place status bar throbber update (replaces periodic milestone spam in feed)
+        self.set_interval(0.25, self._update_active_status_bar)
 
         # Focus input
         self.query_one("#prompt-input", Input).focus()
 
-    def _check_running_milestones(self) -> None:
-        feed = self.query_one("#superagent-feed", RichLog)
-        for task in self.runner.tasks.values():
-            if task.status == "RUNNING" and task.elapsed_seconds >= 20:
-                feed.write(f"[dim]⏳ [{task.agent.upper()}] Task #{task.task_id} still executing ([yellow]{task.elapsed_formatted}[/yellow])...[/dim]")
+    def _update_active_status_bar(self) -> None:
+        try:
+            status_bar = self.query_one("#feed-status-bar", Static)
+        except Exception:
+            return
+
+        running = [t for t in self.runner.tasks.values() if t.status in ("RUNNING", "TESTING")]
+        if running:
+            self._status_frame_idx = (self._status_frame_idx + 1) % len(THROBBER_FRAMES)
+            throbber = THROBBER_FRAMES[self._status_frame_idx]
+            parts = [f"{throbber} [bold cyan]{t.agent.upper()}[/bold cyan] #{t.task_id} ([yellow]{t.elapsed_formatted}[/yellow])" for t in running]
+            status_bar.update(" | ".join(parts) + " [dim]working...[/dim]")
+        else:
+            status_bar.update("[dim]⚡ Fleet idle • Standing by for next instruction[/dim]")
+
+    def refresh_history_tab(self) -> None:
+        try:
+            hlog = self.query_one("#history-log", RichLog)
+        except Exception:
+            return
+
+        hlog.clear()
+        hlog.write("[bold cyan]───────────────────────────────────────────────[/bold cyan]")
+        hlog.write("[bold white]📜 SuperAgent Conversation & Task History[/bold white]")
+        hlog.write("[dim]Stored records of requests, plans, subagent outputs, and syntheses.[/dim]")
+        hlog.write("[bold cyan]───────────────────────────────────────────────[/bold cyan]\n")
+
+        active_proj = self.cfg.active_project
+        pname = active_proj.name if active_proj else None
+        turns = self.history.list_turns(project_name=pname, limit=30)
+        if not turns:
+            hlog.write("[dim]No historical conversations recorded yet for this project.[/dim]\n")
+            return
+
+        for idx, item in enumerate(turns, 1):
+            hlog.write(f"[bold yellow]Turn #{idx} — [{item.timestamp}][/bold yellow] [dim]({item.project_name})[/dim]")
+            hlog.write(f"  [bold green]❯ User Request:[/bold green] {item.user_prompt}")
+            if item.plan_action == "reply" and item.direct_reply:
+                hlog.write(f"  [bold cyan]💬 Direct Answer:[/bold cyan] {item.direct_reply}")
+            else:
+                hlog.write(f"  [bold magenta]💡 Plan:[/bold magenta] {item.plan_reasoning}")
+                if item.subtasks:
+                    hlog.write("  [bold white]🤖 Subagent Results:[/bold white]")
+                    for s in item.subtasks:
+                        status_color = "green" if s.status == "DONE" else "red"
+                        hlog.write(f"    • [{s.agent.upper()} ({s.effort})] [{status_color}]{s.status}[/{status_color}] in {s.elapsed_formatted}: {s.task_brief[:60]}")
+                        if s.output_clean:
+                            preview = s.output_clean[:200].replace('\n', ' ')
+                            hlog.write(f"      [dim]Findings:[/dim] {preview}...")
+                        if s.diff_summary:
+                            hlog.write(f"      [yellow]Diff:[/yellow] {s.diff_summary}")
+                if item.final_synthesis:
+                    hlog.write(f"  [bold cyan]📋 Fleet Synthesis:[/bold cyan]\n{item.final_synthesis}")
+            hlog.write("[dim]───────────────────────────────────────────────[/dim]\n")
 
     def _render_banner(self) -> str:
         proj = self.cfg.active_project
@@ -252,6 +333,8 @@ class SuperagentApp(App):
     def on_tabbed_content_tab_activated(self, event: TabbedContent.TabActivated) -> None:
         if event.tabbed_content.active == "tab-console" and self.active_task_id:
             self.select_task(self.active_task_id)
+        elif event.tabbed_content.active == "tab-history":
+            self.refresh_history_tab()
 
     def _handle_runner_event_sync(self, task: TaskRecord, event: str) -> None:
         feed = self.query_one("#superagent-feed", RichLog)
@@ -287,23 +370,15 @@ class SuperagentApp(App):
             if task.status == "RUNNING":
                 feed.write(f"[bold cyan]🚀 [{task.agent.upper()}] actively executing Task #{task.task_id}...[/bold cyan]")
             elif task.status == "DONE":
-                feed.write(f"\n[bold green]╭─── [SuperAgent Report: Task Completed] ──────────────────────────[/bold green]")
-                feed.write(f"[bold green]│[/bold green] ✔ [bold white][{task.agent.upper()}][/bold white] finished Task #{task.task_id} in [yellow]⏱ {task.elapsed_formatted}[/yellow]")
+                feed.write(f"[bold green]✔ [{task.agent.upper()}] finished Task #{task.task_id} in [yellow]{task.elapsed_formatted}[/yellow][/bold green]")
                 if task.diff_summary:
-                    feed.write(f"[bold green]│[/bold green] 📊 [dim]Modified repository files:[/dim]\n[yellow]{task.diff_summary}[/yellow]")
-                else:
-                    feed.write(f"[bold green]│[/bold green] ℹ [dim]No git diff detected or changes committed.[/dim]")
-                feed.write(f"[bold green]│[/bold green] 💡 [dim]SuperAgent is standing by for your next instruction.[/dim]")
-                feed.write(f"[bold green]╰─────────────────────────────────────────────────────────────────[/bold green]\n")
+                    feed.write(f"[dim]  📊 Modified: {task.diff_summary}[/dim]")
             elif task.status == "FAILED":
-                feed.write(f"\n[bold red]╭─── [SuperAgent Alert: Task Failed] ─────────────────────────────[/bold red]")
-                feed.write(f"[bold red]│[/bold red] ✖ [bold white][{task.agent.upper()}][/bold white] exited with code {task.returncode} after [yellow]⏱ {task.elapsed_formatted}[/yellow]")
+                feed.write(f"[bold red]✖ [{task.agent.upper()}] Task #{task.task_id} exited with code {task.returncode}[/bold red]")
                 if task.error_summary:
-                    feed.write(f"[bold red]│[/bold red] 🔍 [dim]Recent error output:[/dim]\n[red]{task.error_summary}[/red]")
-                feed.write(f"[bold red]│[/bold red] 💡 [dim]Switch to 'Subagent Console' tab to inspect the full trace.[/dim]")
-                feed.write(f"[bold red]╰─────────────────────────────────────────────────────────────────[/bold red]\n")
+                    feed.write(f"[red]  Error: {task.error_summary}[/red]")
             elif task.status == "CANCELLED":
-                feed.write(f"[magenta]🚫 [{task.agent.upper()}] Task #{task.task_id} was cancelled by user.[/magenta]\n")
+                feed.write(f"[magenta]🚫 [{task.agent.upper()}] Task #{task.task_id} was cancelled by user.[/magenta]")
 
     def on_subagent_card_selected(self, message: SubagentCard.Selected) -> None:
         self.select_task(message.card.task_record.task_id)
@@ -321,7 +396,7 @@ class SuperagentApp(App):
             log_widget.write(f"[bold cyan]=== Task #{task.task_id} for {task.agent.upper()} ({task.effort.upper()} effort) ===[/bold cyan]")
             log_widget.write(f"[dim]Project: {task.project_name} | Directory: {task.cwd}[/dim]")
             log_widget.write(f"[bold white]Objective:[/bold white] {task.task_desc}")
-            log_widget.write("[dim]─────────────────────────────────────────────────────────────────[/dim]\n")
+            log_widget.write("[dim]───────────────────────────────────────────────[/dim]\n")
             for line in task.log_lines:
                 log_widget.write(line)
 
@@ -359,9 +434,22 @@ class SuperagentApp(App):
 
         # If it's a conversational / query prompt: answer directly in the feed without subprocess!
         if decision.action == "reply":
-            feed.write(f"[bold cyan]╭─── [SuperAgent Direct Reply] ──────────────────────────────────[/bold cyan]")
+            feed.write(f"[bold cyan]╭─── [SuperAgent Direct Reply] ─────────────────[/bold cyan]")
             feed.write(f"[bold cyan]│[/bold cyan] [bold white]{decision.reply_text}[/bold white]")
-            feed.write(f"[bold cyan]╰───────────────────────────────────────────────────────────────[/bold cyan]\n")
+            feed.write(f"[bold cyan]╰───────────────────────────────────────────────[/bold cyan]\n")
+
+            # Save conversational turn to history
+            turn_id = f"turn_{int(time.time())}_{uuid.uuid4().hex[:6]}"
+            item = HistoryItem(
+                id=turn_id,
+                project_name=proj.name,
+                project_path=proj.path,
+                user_prompt=prompt,
+                plan_action="reply",
+                plan_reasoning=decision.reasoning or "Direct response",
+                direct_reply=decision.reply_text
+            )
+            self.history.save_turn(item)
             return
 
         # Multi-task or single-task delegation
@@ -376,15 +464,28 @@ class SuperagentApp(App):
             )]
 
         count = len(tasks)
-        feed.write(f"[bold magenta]╭─── [SuperAgent Decision: Spawning {count} Subagent(s)] ────────[/bold magenta]")
+        feed.write(f"[bold magenta]╭─── [SuperAgent Plan: Spawning {count} Subagent(s)] ───[/bold magenta]")
         feed.write(f"[bold magenta]│[/bold magenta] 💡 [bold white]Plan:[/bold white] {decision.reasoning or 'Decomposing and launching in background.'}")
         for idx, t in enumerate(tasks, 1):
-            feed.write(f"[bold magenta]│[/bold magenta] {idx}. [bold green][{t.agent.upper()}][/bold green] [yellow]({t.effort} effort)[/yellow]: {t.task_brief}")
-        feed.write(f"[bold magenta]│[/bold magenta] 🚀 [dim]Status:[/dim] Launching {count} background worker(s)...")
-        feed.write(f"[bold magenta]╰───────────────────────────────────────────────────────────────[/bold magenta]\n")
+            feed.write(f"[bold magenta]│[/bold magenta] {idx}. [bold green][{t.agent.upper()}][/bold green] [yellow]({t.effort} effort)[/yellow]: {t.title or t.task_brief[:40]}")
+            feed.write(f"[bold magenta]│[/bold magenta]    [dim]Brief: {t.task_brief}[/dim]")
+        feed.write(f"[bold magenta]│[/bold magenta] 🚀 [dim]Status: Workers dispatched in background.[/dim]")
+        feed.write(f"[bold magenta]╰───────────────────────────────────────────────[/bold magenta]\n")
 
+        turn_id = f"turn_{int(time.time())}_{uuid.uuid4().hex[:6]}"
+        turn_item = HistoryItem(
+            id=turn_id,
+            project_name=proj.name,
+            project_path=proj.path,
+            user_prompt=prompt,
+            plan_action="delegate",
+            plan_reasoning=decision.reasoning or f"Decomposed into {count} task(s)",
+            subtasks=[]
+        )
+
+        task_records: List[TaskRecord] = []
         # Spawn each task concurrently in background!
-        for t in tasks:
+        for idx, t in enumerate(tasks):
             task_record = self.runner.create_task(
                 agent=t.agent,
                 task_desc=t.task_brief,
@@ -392,8 +493,59 @@ class SuperagentApp(App):
                 cwd=proj.path,
                 effort=t.effort
             )
-            self.select_task(task_record.task_id)
+            task_records.append(task_record)
+            if idx == 0:
+                self.select_task(task_record.task_id)
             asyncio.create_task(self.runner.execute_task(task_record))
+
+        # Launch batch monitor and planning model synthesis!
+        asyncio.create_task(self._monitor_and_synthesize_batch(turn_item, task_records, proj))
+
+    async def _monitor_and_synthesize_batch(
+        self,
+        turn_item: HistoryItem,
+        task_records: List[TaskRecord],
+        proj: ProjectConfig
+    ) -> None:
+        # Wait until all subagents in this batch reach terminal state
+        while any(t.status in ("QUEUED", "RUNNING", "TESTING") for t in task_records):
+            await asyncio.sleep(0.5)
+
+        feed = self.query_one("#superagent-feed", RichLog)
+
+        # Planning model synthesizes what all subagents accomplished
+        synthesis = await self.brain.synthesize_results(
+            user_prompt=turn_item.user_prompt,
+            plan_reasoning=turn_item.plan_reasoning,
+            task_records=task_records,
+            project_context=proj.to_dict()
+        )
+
+        # Output synthesis to Feed
+        feed.write(f"\n[bold cyan]╭─── [SuperAgent Fleet Synthesis: Plan Completed] ───────[/bold cyan]")
+        feed.write(f"[bold cyan]│[/bold cyan] 🎯 [bold white]Original Request:[/bold white] {turn_item.user_prompt}")
+        feed.write(f"[bold cyan]│[/bold cyan] 📋 [bold white]Coordinator Summary:[/bold white]")
+        for sline in synthesis.splitlines():
+            feed.write(f"[bold cyan]│[/bold cyan]   {sline}")
+        feed.write(f"[bold cyan]│[/bold cyan] 💡 [dim]All tasks finished. Record saved to History (Ctrl+H).[/dim]")
+        feed.write(f"[bold cyan]╰───────────────────────────────────────────────────────────[/bold cyan]\n")
+
+        # Save to persistent history
+        for t in task_records:
+            turn_item.subtasks.append(SubtaskRecordData(
+                task_id=t.task_id,
+                agent=t.agent,
+                effort=t.effort,
+                title=getattr(t, "title", t.task_desc[:30]),
+                task_brief=t.task_desc,
+                status=t.status,
+                elapsed_formatted=t.elapsed_formatted,
+                output_clean=t.clean_output,
+                diff_summary=t.diff_summary,
+                error_summary=t.error_summary
+            ))
+        turn_item.final_synthesis = synthesis
+        self.history.save_turn(turn_item)
 
     async def _handle_command(self, cmd_line: str) -> None:
         feed = self.query_one("#superagent-feed", RichLog)
@@ -452,17 +604,24 @@ class SuperagentApp(App):
         elif cmd == ":clear":
             self.action_clear_finished()
 
+        elif cmd in (":h", ":history"):
+            tabs = self.query_one("#main-tabs", TabbedContent)
+            tabs.active = "tab-history"
+            self.refresh_history_tab()
+
         elif cmd == ":help":
             feed.write("\n[bold cyan]SuperAgent Commands:[/bold cyan]")
             feed.write("  @codex <task>      - Delegate task to OpenAI Codex CLI")
             feed.write("  @agy <task>        - Delegate task to Google Antigravity CLI")
             feed.write("  @claude <task>     - Delegate task to Anthropic Claude Code")
+            feed.write("  :history (or :h)   - View conversation & task history (or Ctrl+H)")
             feed.write("  :key <api-key>     - Set Gemini API key for integrated brain")
             feed.write("  :projects          - List all configured projects")
             feed.write("  :p <name>          - Switch active project (or Ctrl+P)")
             feed.write("  :add <name> <path> - Register a new project repository")
             feed.write("  :cancel [id]       - Cancel task (or Ctrl+K)")
             feed.write("  :clear             - Remove finished/failed cards (or Ctrl+L)")
+            feed.write("  Ctrl+H             - Switch to History tab")
             feed.write("  Ctrl+Y             - Copy entire log to clipboard")
             feed.write("  Ctrl+Q             - Exit SuperAgent")
             feed.write("[dim]Note: Conversational prompts answer directly. Coding tasks delegate with adaptive effort.[/dim]\n")

@@ -25,6 +25,8 @@ STATUS_ICONS = {
     "CANCELLED": "🚫",
 }
 
+THROBBER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+
 class SubagentCard(Static):
     """Interactive card representing a single subagent task."""
     
@@ -41,17 +43,22 @@ class SubagentCard(Static):
     def __init__(self, task_record: TaskRecord):
         super().__init__()
         self.task_record = task_record
+        self._frame_idx = 0
 
     def on_mount(self) -> None:
-        self.set_interval(1.0, self.refresh_timer)
+        self.set_interval(0.25, self.refresh_timer)
         self.refresh_display()
 
     def refresh_timer(self) -> None:
-        if self.task_record.status in ("RUNNING", "TESTING"):
+        if self.task_record.status in ("RUNNING", "TESTING", "QUEUED"):
+            self._frame_idx = (self._frame_idx + 1) % len(THROBBER_FRAMES)
             self.refresh_display()
 
     def refresh_display(self) -> None:
-        icon = STATUS_ICONS.get(self.task_record.status, "•")
+        if self.task_record.status == "RUNNING":
+            icon = THROBBER_FRAMES[self._frame_idx]
+        else:
+            icon = STATUS_ICONS.get(self.task_record.status, "•")
         color = STATUS_COLORS.get(self.task_record.status, "white")
         agent_name = self.task_record.agent.upper()
         timer_str = f"⏱ {self.task_record.elapsed_formatted}"

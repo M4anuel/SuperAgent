@@ -81,6 +81,27 @@ class TaskRecord:
             return f"{hours:02d}h:{mins:02d}m:{s:02d}s"
         return f"{mins:02d}m:{s:02d}s"
 
+    @property
+    def clean_output(self) -> str:
+        """Extracts substantive output from subagent CLI logs, omitting startup banner noise."""
+        if not self.log_lines:
+            return ""
+
+        filtered: List[str] = []
+        skip_prefixes = (
+            "OpenAI Codex", "workdir:", "model:", "provider:", "approval:", "sandbox:",
+            "reasoning effort:", "reasoning summaries:", "session id:", "tokens used",
+            "Reading additional input", "--------", "user", "codex", "[Superagent Error]"
+        )
+        for line in self.log_lines:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if any(stripped.startswith(p) for p in skip_prefixes):
+                continue
+            filtered.append(line)
+        return "\n".join(filtered).strip()
+
 class SubagentRunner:
     def __init__(self):
         self.tasks: Dict[str, TaskRecord] = {}

@@ -105,3 +105,90 @@ def test_runner_agents_md_injection(tmp_path):
     assert any("[Follow AGENTS.md in repo]" in arg for arg in task.cmd)
     assert '-c' in task.cmd
     assert 'model_reasoning_effort="high"' in task.cmd
+
+def test_task_clean_output():
+    task = TaskRecord(
+        task_id="t123",
+        agent="codex",
+        task_desc="Analyze models",
+        project_name="proj",
+        cwd=".",
+        cmd=["codex", "exec", "test"]
+    )
+    task.log_lines = [
+        "OpenAI Codex v0.165.0",
+        "workdir: C:\\test",
+        "model: gpt-6.1-sol",
+        "tokens used",
+        "3,312",
+        "Found 2 potential race conditions in session_manager.py.",
+        "Recommended adding async locks around state mutation."
+    ]
+    clean = task.clean_output
+    assert "OpenAI Codex" not in clean
+    assert "tokens used" not in clean
+    assert "Found 2 potential race conditions in session_manager.py." in clean
+    assert "Recommended adding async locks around state mutation." in clean
+
+from superagent.history import HistoryManager, HistoryItem, SubtaskRecordData
+
+def test_history_persistence(tmp_path):
+    hm = HistoryManager(base_dir=tmp_path)
+    item = HistoryItem(
+        id="turn_test_123",
+        project_name="alpha",
+        project_path=str(tmp_path),
+        user_prompt="check auth logic",
+        plan_action="delegate",
+        plan_reasoning="Decomposed into backend and frontend reviews",
+        subtasks=[
+            SubtaskRecordData(
+                task_id="sub_1",
+                agent="codex",
+                status="DONE",
+                task_brief="Review backend auth",
+                output_clean="All tokens properly verified."
+            )
+        ],
+        final_synthesis="Auth review passed cleanly."
+    )
+    hm.save_turn(item)
+    
+    # Retrieve
+    loaded = hm.get_turn("turn_test_123")
+    assert loaded is not None
+    assert loaded.user_prompt == "check auth logic"
+    assert len(loaded.subtasks) == 1
+    assert loaded.subtasks[0].agent == "codex"
+    assert loaded.final_synthesis == "Auth review passed cleanly."
+
+    # List
+    items = hm.list_turns(project_name="alpha")
+    assert len(items) == 1
+    assert items[0].id == "turn_test_123"
+
+    # Filter other project
+    assert len(hm.list_turns(project_name="beta")) == 0
+
+@pytest.mark.asyncio
+async def test_brain_synthesis():
+    brain = SuperagentBrain()
+    task1 = TaskRecord("t1", "codex", "Audit backend", "p", ".", ["cmd"])
+    task1.status = "DONE"
+    task1.log_lines = ["Verified 15 endpoints.", "Added 2 missing input validations."]
+    task1.diff_summary = "3 files changed, 25 insertions(+)"
+
+    task2 = TaskRecord("t2", "agy", "Audit frontend", "p", ".", ["cmd"])
+    task2.status = "DONE"
+    task2.log_lines = ["Checked all responsive modals.", "No layout overflow found."]
+
+    synthesis = await brain.synthesize_results(
+        user_prompt="audit full application",
+        plan_reasoning="split into backend and frontend audit",
+        task_records=[task1, task2],
+        project_context={"name": "p", "path": "."}
+    )
+    assert "Fleet Execution: 2/2" in synthesis
+    assert "[CODEX]" in synthesis
+    assert "[AGY]" in synthesis
+    assert "Repository changes detected" in synthesis

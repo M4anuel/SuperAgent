@@ -419,3 +419,80 @@ class SuperagentBrain:
             tasks=tasks,
             reasoning=reasoning
         )
+
+    async def synthesize_results(
+        self,
+        user_prompt: str,
+        plan_reasoning: str,
+        task_records: List[Any],
+        project_context: Dict[str, Any]
+    ) -> str:
+        """Synthesizes the findings and outputs of completed subagents into a unified coordinator report."""
+        if not task_records:
+            return "No subagent tasks were executed."
+
+        # If Gemini Flash is available, generate an intelligent synthesis
+        if self.client:
+            try:
+                reports = []
+                for t in task_records:
+                    out = t.clean_output[:1000] if getattr(t, "clean_output", None) else "No output."
+                    diff = t.diff_summary or "No file changes detected."
+                    reports.append(
+                        f"Subagent [{t.agent.upper()} ({t.effort} effort)] - Status: {t.status} ({t.elapsed_formatted})\n"
+                        f"Brief: {t.task_desc}\n"
+                        f"Output: {out}\n"
+                        f"Modified Files: {diff}"
+                    )
+                reports_joined = "\n\n".join(reports)
+                prompt = (
+                    f"User Prompt: {user_prompt}\n"
+                    f"Initial Plan: {plan_reasoning}\n\n"
+                    f"Subagent Reports:\n{reports_joined}\n\n"
+                    "Synthesize the work done by the fleet. Provide:\n"
+                    "1. A concise overview of what was accomplished.\n"
+                    "2. Key insights or conclusions from each subagent.\n"
+                    "3. Any modified files or next steps for the user."
+                )
+                response = self.client.models.generate_content(
+                    model="gemini-2.5-flash",
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        temperature=0.3,
+                    )
+                )
+                if response.text:
+                    return response.text.strip()
+            except Exception:
+                pass
+
+        # Structured synthesis (instant, reliable, no external API needed)
+        lines: List[str] = []
+        successful = sum(1 for t in task_records if t.status == "DONE")
+        total = len(task_records)
+        lines.append(f"• Fleet Execution: {successful}/{total} subagent task(s) completed successfully.")
+        
+        for t in task_records:
+            status_icon = "✔" if t.status == "DONE" else "✖"
+            header = f"• [{t.agent.upper()}] ({t.effort} effort, {t.elapsed_formatted}) {status_icon} {t.status}:"
+            lines.append(header)
+            
+            clean = getattr(t, "clean_output", "").strip()
+            if clean:
+                preview_lines = [l.strip() for l in clean.splitlines() if l.strip()]
+                preview = " ".join(preview_lines[:3])
+                if len(preview) > 280:
+                    preview = preview[:277] + "..."
+                lines.append(f"  Findings: {preview}")
+            else:
+                lines.append(f"  Task '{t.task_desc}' finished.")
+
+            if getattr(t, "diff_summary", None):
+                lines.append(f"  Modified: {t.diff_summary}")
+
+        if any(getattr(t, "diff_summary", None) for t in task_records):
+            lines.append("• Repository changes detected. Review git status or switch to Subagent Console for details.")
+        else:
+            lines.append("• Analysis complete. No repository file changes were committed.")
+
+        return "\n".join(lines)
