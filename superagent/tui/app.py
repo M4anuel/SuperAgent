@@ -437,8 +437,11 @@ class SuperagentApp(App):
     async def _process_user_task(self, prompt: str, proj: ProjectConfig) -> None:
         feed = self.query_one("#superagent-feed", RichLog)
 
-        # First Responder Triage
-        decision = await self.brain.triage(prompt, proj.to_dict())
+        def report_status(msg: str) -> None:
+            feed.write(f"[dim]{msg}[/dim]")
+
+        # First Responder Triage & Planning
+        decision = await self.brain.triage(prompt, proj.to_dict(), on_status=report_status)
 
         # If it's a conversational / query prompt: answer directly in the feed without subprocess!
         if decision.action == "reply":

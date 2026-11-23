@@ -5,7 +5,7 @@ import os
 import re
 import shutil
 from pathlib import Path
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Callable
 from pydantic import BaseModel, Field
 
 try:
@@ -115,196 +115,34 @@ class SuperagentBrain:
         if agent.lower() in ("codex", "agy", "antigravity"):
             self.first_responder = "agy" if agent.lower() in ("agy", "antigravity") else "codex"
 
-    async def triage(self, user_prompt: str, project_context: Dict[str, Any]) -> TriageDecision:
+    async def triage(
+        self,
+        user_prompt: str,
+        project_context: Dict[str, Any],
+        on_status: Optional[Callable[[str], None]] = None
+    ) -> TriageDecision:
         clean = user_prompt.strip()
 
-        # 1. Fast path: check instantaneous local heuristics for common conversational cues & direct requests
-        fast = self._local_heuristic_triage(clean, project_context)
-        if fast.action == "reply":
+        # 1. Tier 1 (Fast Agent / Triage - 0ms):
+        # Checks for direct conversational queries, explicit @agent routing, or minor atomic edits.
+        fast = self._fast_triage(clean, project_context)
+        if fast is not None:
             return fast
 
-        # If user explicitly routed to an agent or asked for multi-agent delegation or clear coding task:
-        # Return instantaneous local triage (0ms latency, zero UI lag or freezing!)
-        lower = clean.lower()
-        if (
-            lower.startswith("@claude")
-            or lower.startswith("@codex")
-            or lower.startswith("@agy")
-            or lower.startswith("@antigravity")
-            or len(fast.tasks) > 1
-            or fast.action == "delegate"
-        ):
-            return fast
+        # 2. Tier 2 (The Planning Model):
+        # Non-trivial, complex, or multi-domain tasks are evaluated by the Planning Brain
+        # to dynamically determine fleet decomposition, agent roles, and adaptive effort.
+        if on_status:
+            on_status(f"🧠 Planning Model ({self.mode_description}) formulating fleet decomposition...")
+        return await self._run_planning_model(clean, project_context)
 
-        # 2. If Gemini API key is available, use Gemini Flash
-        if self.client:
-            try:
-                project_notes = self._get_project_knowledge(project_context.get("path"))
-                prompt_with_context = (
-                    f"Active Project: {project_context.get('name', 'unknown')} ({project_context.get('path', '')})\n"
-                    f"Default Agent: {project_context.get('default_agent', 'codex')}\n"
-                    f"Project Guidelines:\n{project_notes}\n\n"
-                    f"User Prompt: {clean}"
-                )
-                response = self.client.models.generate_content(
-                    model="gemini-2.5-flash",
-                    contents=prompt_with_context,
-                    config=types.GenerateContentConfig(
-                        system_instruction=SYSTEM_TRIAGE_INSTRUCTION,
-                        response_mime_type="application/json",
-                        response_schema=TriageDecision,
-                        temperature=0.2,
-                    )
-                )
-                if response.text:
-                    data = json.loads(response.text)
-                    return TriageDecision(**data)
-            except Exception:
-                pass
-
-        # 3. Subscription Mode: Use the low-effort CLI First Responder (Codex or Antigravity)
-        return await self._cli_first_responder(clean, project_context, fallback_decision=fast)
-
-    def _get_project_knowledge(self, project_path: Optional[str]) -> str:
-        """Reads project AGENTS.md or README.md if present to inform triage."""
-        if not project_path:
-            return "No project path provided."
-        p = Path(project_path)
-        for fname in ("AGENTS.md", "CLAUDE.md", "README.md"):
-            doc_file = p / fname
-            if doc_file.exists():
-                try:
-                    content = doc_file.read_text(encoding="utf-8")
-                    return content[:1500]  # First 1500 chars for context
-                except Exception:
-                    pass
-        return "Standard software project."
-
-    async def _cli_first_responder(
-        self,
-        prompt: str,
-        project_context: Dict[str, Any],
-        fallback_decision: TriageDecision
-    ) -> TriageDecision:
-        cli_agent = self.first_responder
-        triage_prompt = (
-            "You are the SuperAgent First Responder coordinator. "
-            "Available fleet agents: codex (backend/logic), agy (frontend/tools), claude. "
-            "If user prompt is conversational or a question, reply directly (do not write code). "
-            "If user prompt requires coding, testing, or auditing: "
-            "If user asks for multiple subagents (e.g. 'spawn 2 subagents'), output MULTIPLE DELEGATE lines! "
-            "Format each task on its own line: DELEGATE: <agent: codex|agy|claude> | effort: <low|medium|high> | <task brief>. "
-            f"User prompt: {prompt}"
-        )
-
-        cwd = project_context.get("path") or os.getcwd()
-
-        try:
-            from superagent.runner import resolve_executable
-            if cli_agent == "codex":
-                exec_prefix = resolve_executable("codex")
-                cmd = exec_prefix + [
-                    "exec",
-                    "--skip-git-repo-check",
-                    "--dangerously-bypass-approvals-and-sandbox",
-                    "-c", 'model_reasoning_effort="low"',
-                    "-C", cwd,
-                    triage_prompt
-                ]
-            else:
-                exec_prefix = resolve_executable("agy")
-                cmd = exec_prefix + ["--dangerously-skip-permissions", "--effort", "low", "--print", triage_prompt]
-
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                cwd=cwd,
-                stdin=asyncio.subprocess.DEVNULL,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT
-            )
-
-            stdout_bytes, _ = await asyncio.wait_for(proc.communicate(), timeout=30.0)
-            output = stdout_bytes.decode("utf-8", errors="replace").strip()
-            lines = [l.strip() for l in output.splitlines() if l.strip()]
-
-            # Look for one or more DELEGATE lines
-            delegate_lines = [l for l in lines if "DELEGATE:" in l]
-            if delegate_lines:
-                tasks: List[SubtaskItem] = []
-                seen_briefs = set()
-                for d_line in delegate_lines:
-                    if "<agent:" in d_line or "<low|" in d_line:
-                        continue  # skip instruction echoes
-                    parts = d_line.split("DELEGATE:", 1)[1].split("|")
-                    agent = parts[0].strip().lower() if len(parts) > 0 else "codex"
-                    effort = "medium"
-                    if len(parts) > 1 and "effort:" in parts[1]:
-                        effort = parts[1].replace("effort:", "").strip().lower()
-                    task_brief = parts[2].strip() if len(parts) > 2 else prompt
-
-                    if agent not in ("codex", "agy", "claude"):
-                        agent = "codex"
-                    if effort not in ("low", "medium", "high"):
-                        effort = "medium"
-
-                    if task_brief in seen_briefs:
-                        continue
-                    seen_briefs.add(task_brief)
-
-                    title = task_brief[:30] + "..." if len(task_brief) > 30 else task_brief
-                    tasks.append(SubtaskItem(
-                        agent=agent,
-                        effort=effort,
-                        title=title,
-                        task_brief=task_brief
-                    ))
-
-                return TriageDecision(
-                    action="delegate",
-                    tasks=tasks,
-                    reasoning=f"Decomposed into {len(tasks)} subagent task(s) by {cli_agent.upper()} First Responder."
-                )
-
-            # Direct response text
-            resp_lines: List[str] = []
-            for l in lines:
-                if (
-                    l.startswith("OpenAI Codex")
-                    or l.startswith("workdir:")
-                    or l.startswith("model:")
-                    or l.startswith("provider:")
-                    or l.startswith("approval:")
-                    or l.startswith("sandbox:")
-                    or l.startswith("reasoning effort:")
-                    or l.startswith("reasoning summaries:")
-                    or l.startswith("session id:")
-                    or l.startswith("tokens used")
-                    or l.startswith("--------")
-                    or l == "user"
-                    or l == "codex"
-                    or l.startswith("Reading additional input")
-                ):
-                    continue
-                resp_lines.append(l)
-
-            if resp_lines:
-                return TriageDecision(
-                    action="reply",
-                    reply_text="\n".join(resp_lines).strip(),
-                    reasoning=f"Direct response from {cli_agent.upper()} First Responder."
-                )
-
-        except Exception:
-            pass
-
-        return fallback_decision
-
-    def _local_heuristic_triage(self, prompt: str, project_context: Dict[str, Any]) -> TriageDecision:
+    def _fast_triage(self, prompt: str, project_context: Dict[str, Any]) -> Optional[TriageDecision]:
+        """Tier 1 Fast Triage: handles conversational queries, explicit @agent commands, and minor edits in 0ms."""
         clean = prompt.strip()
         lower = clean.lower()
         default_agent = project_context.get("default_agent", "codex")
 
-        # Conversational cues
+        # 1. Conversational greetings / questions / confirmations
         conversational_phrases = [
             "respond yes", "say yes", "yes", "no", "ok", "okay",
             "hello", "hi", "hey", "who are you", "what can you do",
@@ -329,7 +167,7 @@ class SuperagentBrain:
                 reasoning="Instant conversational reply."
             )
 
-        # Check explicit @agent or @agent:effort routing: e.g. @codex:high, @agy:low, @claude
+        # 2. Explicit agent routing: e.g. @codex:high, @agy:low, @claude
         agent_match = re.match(r"^@(codex|agy|claude|antigravity)(?::(low|medium|high))?\s+(.*)$", clean, re.IGNORECASE)
         if agent_match:
             target_raw = agent_match.group(1).lower()
@@ -347,89 +185,276 @@ class SuperagentBrain:
                 reasoning=f"Explicitly routed to {target_agent.upper()} CLI with {effort} effort."
             )
 
-        # Effort estimation based on prompt keywords
-        high_effort_keywords = ["high effort", "deep reasoning", "deep think", "thorough", "complex", "architecture", "refactor", "rewrite", "redesign", "concurrency", "race condition", "security"]
-        low_effort_keywords = ["low effort", "fast pass", "quick pass", "minimal effort", "typo", "rename", "docstring", "comment", "format", "single line"]
+        # 3. Simple / Minor atomic tweak (typos, single comments, docstrings)
+        minor_keywords = ["typo", "fix spelling", "rename variable", "docstring", "comment", "formatting", "single line"]
+        if any(k in lower for k in minor_keywords) and len(clean.split()) < 10:
+            return TriageDecision(
+                action="delegate",
+                tasks=[SubtaskItem(
+                    agent=default_agent,
+                    effort="low",
+                    title=clean[:30],
+                    task_brief=clean
+                )],
+                reasoning="Minor atomic edit routed directly with low effort."
+            )
 
-        if any(k in lower for k in high_effort_keywords):
-            effort = "high"
-            effort_reason = "High reasoning effort selected."
-        elif any(k in lower for k in low_effort_keywords):
-            effort = "low"
-            effort_reason = "Low reasoning effort selected."
-        else:
-            effort = "medium"
-            effort_reason = "Standard reasoning effort."
-
-        # Check multi-agent intent: e.g. "spawn 2 subagents", "2 agents", "both agents", "codex and agy", "spawn subagents"
-        multi_match = re.search(r"(\d+)\s+(?:sub)?(?:agent|worker)s?", lower)
-        word_numbers = {"two": 2, "three": 3, "four": 4, "pair of": 2}
-        count = 1
-        if multi_match:
-            count = int(multi_match.group(1))
-        else:
-            for word, n in word_numbers.items():
-                if f"{word} subagents" in lower or f"{word} agents" in lower or f"{word} workers" in lower:
-                    count = n
-                    break
-            if count == 1 and (
-                any(w in lower for w in ("both agents", "both subagents", "codex and agy", "agy and codex", "multiple subagents", "multiple agents"))
-                or re.search(r"\b(?:spawn|run|start|create|use)\s+(?:multiple\s+)?(?:sub)?agents\b", lower)
-            ):
-                count = 2
-
-        # Code action verbs trigger delegation
+        # 4. Short conversational fallback (<4 words and no action verbs)
         code_verbs = [
             "fix", "refactor", "write", "add", "create", "implement", "update",
             "delete", "remove", "test", "build", "debug", "check", "audit",
-            "suggestions", "review", "inspect", "analyze", "scan"
+            "suggestions", "review", "inspect", "analyze", "scan", "spawn"
         ]
         is_coding = any(lower.startswith(v) or f" {v} " in lower for v in code_verbs)
-
-        if not is_coding and len(clean.split()) < 4 and count == 1:
+        if not is_coding and len(clean.split()) < 4:
             return TriageDecision(
                 action="reply",
                 reply_text="I'm standing by. Give me a task or instructions for the fleet.",
                 reasoning="Short conversational prompt."
             )
 
-        tasks: List[SubtaskItem] = []
-        if count >= 2:
-            # Multi-agent complementary decomposition
-            tasks.append(SubtaskItem(
-                agent="codex",
-                effort=effort,
-                title="Backend Architecture & Logic Audit",
-                task_brief=f"Focus on backend logic, data models, edge cases, and test suites: {clean}"
-            ))
-            tasks.append(SubtaskItem(
-                agent="agy" if shutil.which("agy") else "codex",
-                effort=effort,
-                title="Frontend & Workflow Audit",
-                task_brief=f"Focus on frontend components, user workflows, and UI suggestions: {clean}"
-            ))
-            if count >= 3:
-                tasks.append(SubtaskItem(
-                    agent="claude" if shutil.which("claude") else "codex",
-                    effort=effort,
-                    title="Code Refactoring & Security Audit",
-                    task_brief=f"Focus on code style, typing, security, and refactoring: {clean}"
-                ))
-            reasoning = f"Decomposed into {len(tasks)} parallel subagents for complementary audit ({effort_reason})."
+        # All other tasks are non-trivial / complex: need the Planning Model!
+        return None
+
+    def _get_project_knowledge(self, project_path: Optional[str]) -> str:
+        """Reads project AGENTS.md or README.md if present to inform triage."""
+        if not project_path:
+            return "No project path provided."
+        p = Path(project_path)
+        for fname in ("AGENTS.md", "CLAUDE.md", "README.md"):
+            doc_file = p / fname
+            if doc_file.exists():
+                try:
+                    content = doc_file.read_text(encoding="utf-8")
+                    return content[:1500]  # First 1500 chars for context
+                except Exception:
+                    pass
+        return "Standard software project."
+
+    def _local_heuristic_triage(self, prompt: str, project_context: Dict[str, Any]) -> TriageDecision:
+        """Fallback local heuristic decomposition."""
+        fast = self._fast_triage(prompt, project_context)
+        if fast is not None:
+            return fast
+
+        clean = prompt.strip()
+        lower = clean.lower()
+        default_agent = project_context.get("default_agent", "codex")
+
+        # Effort estimation based on keywords
+        high_effort_keywords = ["high effort", "deep reasoning", "deep think", "thorough", "complex", "architecture", "refactor", "rewrite", "redesign", "security"]
+        low_effort_keywords = ["low effort", "fast pass", "quick pass", "minimal effort", "typo", "rename"]
+
+        if any(k in lower for k in high_effort_keywords):
+            effort = "high"
+        elif any(k in lower for k in low_effort_keywords):
+            effort = "low"
         else:
-            tasks.append(SubtaskItem(
+            effort = "medium"
+
+        # Multi-agent intent or broad audit/review/testing
+        broad_keywords = ["audit", "review", "inspect", "check the project", "suggestions", "full-stack", "frontend and backend", "subagents", "agents"]
+        is_broad = any(k in lower for k in broad_keywords)
+        wants_three = "3" in lower or "three" in lower
+
+        if is_broad:
+            tasks = [
+                SubtaskItem(
+                    agent="codex",
+                    effort=effort,
+                    title="Backend Architecture & Logic Audit",
+                    task_brief=f"Focus on backend logic, data models, edge cases, and test suites: {clean}"
+                ),
+                SubtaskItem(
+                    agent="agy" if shutil.which("agy") else "codex",
+                    effort=effort,
+                    title="Frontend & Workflow Audit",
+                    task_brief=f"Focus on frontend components, user workflows, and UI suggestions: {clean}"
+                )
+            ]
+            if wants_three:
+                tasks.append(
+                    SubtaskItem(
+                        agent="claude" if shutil.which("claude") else "codex",
+                        effort=effort,
+                        title="Code Refactoring & Security Audit",
+                        task_brief=f"Focus on code style, typing, security, and refactoring: {clean}"
+                    )
+                )
+            return TriageDecision(
+                action="delegate",
+                tasks=tasks,
+                reasoning=f"Decomposed into {len(tasks)} parallel subagents for complementary audit."
+            )
+
+        return TriageDecision(
+            action="delegate",
+            tasks=[SubtaskItem(
                 agent=default_agent,
                 effort=effort,
                 title=clean[:30],
                 task_brief=clean
-            ))
-            reasoning = f"Routed to default agent {default_agent.upper()} ({effort_reason})."
-
-        return TriageDecision(
-            action="delegate",
-            tasks=tasks,
-            reasoning=reasoning
+            )],
+            reasoning=f"Routed to default agent {default_agent.upper()}."
         )
+
+    async def _run_planning_model(self, prompt: str, project_context: Dict[str, Any]) -> TriageDecision:
+        """Tier 2 Planning Model: Evaluates complex task to dynamically determine fleet plan & effort."""
+        fallback = self._local_heuristic_triage(prompt, project_context)
+        default_agent = project_context.get("default_agent", "codex")
+        project_notes = self._get_project_knowledge(project_context.get("path"))
+
+        # 1. If Gemini API key is available, use Gemini 2.5 Flash as the Planner
+        if self.client:
+            try:
+                prompt_with_context = (
+                    f"Active Project: {project_context.get('name', 'unknown')} ({project_context.get('path', '')})\n"
+                    f"Default Agent: {default_agent}\n"
+                    f"Project Guidelines:\n{project_notes}\n\n"
+                    f"User Prompt: {prompt}"
+                )
+                response = self.client.models.generate_content(
+                    model="gemini-2.5-flash",
+                    contents=prompt_with_context,
+                    config=types.GenerateContentConfig(
+                        system_instruction=SYSTEM_TRIAGE_INSTRUCTION,
+                        response_mime_type="application/json",
+                        response_schema=TriageDecision,
+                        temperature=0.2,
+                    )
+                )
+                if response.text:
+                    data = json.loads(response.text)
+                    return TriageDecision(**data)
+            except Exception:
+                pass
+
+        # 2. Subscription Mode: Use the Planning Model via CLI (agy or codex)
+        planning_prompt = (
+            "You are the SuperAgent Planning Model and fleet coordinator.\n"
+            f"Active Project: {project_context.get('name', 'unknown')}\n"
+            f"Project Guidelines Context:\n{project_notes}\n\n"
+            f"User Goal: {prompt}\n\n"
+            "Fleet Capabilities:\n"
+            "- codex: Backend logic, Python, database models, security, test suites, algorithms.\n"
+            "- agy: Frontend UI, TypeScript, React components, client state, responsive design, workflows.\n"
+            "- claude: Refactoring, type-checking, architecture edge cases.\n\n"
+            "Instructions:\n"
+            "- If the task is focused on a single domain or straightforward, output 1 subagent task.\n"
+            "- If the task is complex, multi-domain, full-stack, or broad audit/review/testing, decompose it into 2 or more complementary subagent tasks running in parallel across the fleet.\n"
+            "- If the user specifies a number of subagents or tasks (e.g. 'spawn 2 subagents', 'spawn 3 subagents'), respect their request and output that number of DELEGATE lines for complementary fleet agents.\n"
+            "- Format strictly as:\n"
+            "PLAN: <1-sentence overview of coordination strategy>\n"
+            "DELEGATE: <agent: codex|agy|claude> | effort: <low|medium|high> | <actionable task brief>\n"
+        )
+
+        cwd = project_context.get("path") or os.getcwd()
+        cli_agent = self.first_responder
+
+        try:
+            from superagent.runner import resolve_executable
+            if cli_agent == "agy":
+                exec_prefix = resolve_executable("agy")
+                cmd = exec_prefix + ["--dangerously-skip-permissions", "--effort", "low", "-p", planning_prompt]
+            else:
+                exec_prefix = resolve_executable("codex")
+                cmd = exec_prefix + [
+                    "exec",
+                    "--skip-git-repo-check",
+                    "--dangerously-bypass-approvals-and-sandbox",
+                    "-c", 'model_reasoning_effort="low"',
+                    "-C", cwd,
+                    planning_prompt
+                ]
+
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                cwd=cwd,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT
+            )
+
+            stdout_bytes, _ = await asyncio.wait_for(proc.communicate(), timeout=25.0)
+            output = stdout_bytes.decode("utf-8", errors="replace").strip()
+            lines = [l.strip() for l in output.splitlines() if l.strip()]
+
+            # Look for PLAN: and DELEGATE: lines
+            plan_line = next((l.split("PLAN:", 1)[1].strip() for l in lines if "PLAN:" in l), "")
+            delegate_lines = [l for l in lines if "DELEGATE:" in l]
+
+            if delegate_lines:
+                tasks: List[SubtaskItem] = []
+                seen_briefs = set()
+                for d_line in delegate_lines:
+                    if "<agent:" in d_line or "<low|" in d_line:
+                        continue  # skip echoes
+                    parts = d_line.split("DELEGATE:", 1)[1].split("|")
+                    agent = parts[0].replace("*", "").replace("`", "").strip().lower() if len(parts) > 0 else default_agent
+                    effort = "medium"
+                    if len(parts) > 1 and "effort:" in parts[1]:
+                        effort = parts[1].replace("effort:", "").replace("*", "").replace("`", "").strip().lower()
+                    task_brief = parts[2].replace("*", "").replace("`", "").strip() if len(parts) > 2 else prompt
+
+                    if agent not in ("codex", "agy", "claude"):
+                        agent = default_agent
+                    if effort not in ("low", "medium", "high"):
+                        effort = "medium"
+
+                    if task_brief in seen_briefs:
+                        continue
+                    seen_briefs.add(task_brief)
+
+                    title = task_brief[:30] + "..." if len(task_brief) > 30 else task_brief
+                    tasks.append(SubtaskItem(
+                        agent=agent,
+                        effort=effort,
+                        title=title,
+                        task_brief=task_brief
+                    ))
+
+                if tasks:
+                    reasoning = plan_line or f"Decomposed into {len(tasks)} subagent task(s) by Planning Model."
+                    return TriageDecision(
+                        action="delegate",
+                        tasks=tasks,
+                        reasoning=reasoning
+                    )
+
+            # Direct response check if no DELEGATE lines
+            resp_lines: List[str] = []
+            for l in lines:
+                if (
+                    l.startswith("OpenAI Codex")
+                    or l.startswith("workdir:")
+                    or l.startswith("model:")
+                    or l.startswith("provider:")
+                    or l.startswith("approval:")
+                    or l.startswith("sandbox:")
+                    or l.startswith("reasoning effort:")
+                    or l.startswith("reasoning summaries:")
+                    or l.startswith("session id:")
+                    or l.startswith("tokens used")
+                    or l.startswith("--------")
+                    or l == "user"
+                    or l == "codex"
+                    or l.startswith("Reading additional input")
+                    or l.startswith("PLAN:")
+                ):
+                    continue
+                resp_lines.append(l)
+
+            if resp_lines and not any(k in prompt.lower() for k in ("fix", "test", "audit", "check", "write", "create", "refactor", "code")):
+                return TriageDecision(
+                    action="reply",
+                    reply_text="\n".join(resp_lines).strip(),
+                    reasoning=f"Direct response from {cli_agent.upper()} Planning Model."
+                )
+
+        except Exception:
+            pass
+
+        return fallback
 
     async def synthesize_results(
         self,

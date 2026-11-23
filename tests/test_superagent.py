@@ -227,3 +227,50 @@ async def test_markup_crash_resilience():
         
         # Verify app is still running and did not crash
         assert app.is_running is True
+
+@pytest.mark.asyncio
+async def test_dynamic_planning_decomposition():
+    brain = SuperagentBrain()
+    proj = {"name": "testproj", "path": ".", "default_agent": "codex"}
+
+    # 1. Tier 1 Fast Triage returns None for complex task
+    complex_prompt = "audit the entire application architecture and suggest improvements"
+    fast_res = brain._fast_triage(complex_prompt, proj)
+    assert fast_res is None
+
+    # 2. Fast Triage handles conversational and minor atomic immediately
+    conv = brain._fast_triage("ping", proj)
+    assert conv is not None and conv.action == "reply"
+
+    minor = brain._fast_triage("fix typo in login button", proj)
+    assert minor is not None and minor.action == "delegate"
+    assert minor.effort == "low"
+
+    # 3. Simulate Planning Model output parsing with markdown formatting
+    simulated_output = (
+        "PLAN: Coordinate a complementary two-agent audit across backend and frontend.\n"
+        "**DELEGATE:** codex | effort: high | Deep audit of session management and SQLite locks\n"
+        "- DELEGATE: `agy` | effort: medium | Verify React component responsive layouts and dark mode\n"
+    )
+
+    lines = [l.strip() for l in simulated_output.splitlines() if l.strip()]
+    plan_line = next((l.split("PLAN:", 1)[1].strip() for l in lines if "PLAN:" in l), "")
+    delegate_lines = [l for l in lines if "DELEGATE:" in l]
+
+    tasks = []
+    seen = set()
+    for d_line in delegate_lines:
+        parts = d_line.split("DELEGATE:", 1)[1].split("|")
+        agent = parts[0].replace("*", "").replace("`", "").strip().lower()
+        effort = "medium"
+        if len(parts) > 1 and "effort:" in parts[1]:
+            effort = parts[1].replace("effort:", "").replace("*", "").replace("`", "").strip().lower()
+        brief = parts[2].replace("*", "").replace("`", "").strip() if len(parts) > 2 else ""
+        if brief and brief not in seen:
+            seen.add(brief)
+            tasks.append((agent, effort, brief))
+
+    assert len(tasks) == 2
+    assert tasks[0] == ("codex", "high", "Deep audit of session management and SQLite locks")
+    assert tasks[1] == ("agy", "medium", "Verify React component responsive layouts and dark mode")
+
