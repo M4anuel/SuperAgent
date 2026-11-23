@@ -70,14 +70,12 @@ Screen {
 }
 
 #main-tabs {
-    height: 100%;
+    height: 1fr;
     overflow-x: hidden;
 }
 
 TabPane {
-    height: 100%;
     padding: 0;
-    overflow-x: hidden;
 }
 
 RichLog {
@@ -335,9 +333,14 @@ class SuperagentApp(App):
         self._handle_runner_event_sync(message.task, message.event)
 
     def on_tabbed_content_tab_activated(self, event: TabbedContent.TabActivated) -> None:
-        if event.tabbed_content.active == "tab-console" and self.active_task_id:
-            self.select_task(self.active_task_id)
-        elif event.tabbed_content.active == "tab-history":
+        pane_id = getattr(event.pane, "id", "") or event.tabbed_content.active
+        if pane_id == "tab-console":
+            target_id = self.active_task_id
+            if not target_id and self.runner.tasks:
+                target_id = next(reversed(self.runner.tasks))
+            if target_id:
+                self.select_task(target_id)
+        elif pane_id == "tab-history":
             self.refresh_history_tab()
 
     def _handle_runner_event_sync(self, task: TaskRecord, event: str) -> None:
@@ -387,6 +390,8 @@ class SuperagentApp(App):
 
     def on_subagent_card_selected(self, message: SubagentCard.Selected) -> None:
         self.select_task(message.card.task_record.task_id)
+        tabs = self.query_one("#main-tabs", TabbedContent)
+        tabs.active = "tab-console"
 
     def select_task(self, task_id: str) -> None:
         self.active_task_id = task_id
