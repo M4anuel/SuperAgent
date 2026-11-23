@@ -191,7 +191,8 @@ class SuperagentApp(App):
             self.cfg.set_active_project(initial_project)
         self.brain = SuperagentBrain(
             api_key=self.cfg.gemini_api_key,
-            first_responder=self.cfg.first_responder
+            first_responder=self.cfg.first_responder,
+            available_agents=self.cfg.get_enabled_agents()
         )
         self.history = HistoryManager()
         self.runner = SubagentRunner()
@@ -229,7 +230,7 @@ class SuperagentApp(App):
 
         with Container(id="input-container"):
             yield Input(
-                placeholder="Ask Superagent: '@claude <task>', '@codex <task>', '@agy <task>' or ':help'",
+                placeholder="Ask Superagent: '@codex <task>', '@agy <task>', or ':help'",
                 id="prompt-input"
             )
 
@@ -242,7 +243,8 @@ class SuperagentApp(App):
         active_proj = self.cfg.active_project
         pname = active_proj.name if active_proj else "None"
         agent = active_proj.default_agent.upper() if active_proj else "CODEX"
-        feed.write(f"[dim]• Default Subagent: [/dim][bold green]{agent} CLI[/bold green]  [dim]| Active Project: [/dim][bold cyan]{pname}[/bold cyan]")
+        active_agents = ", ".join(a.upper() for a in self.cfg.get_enabled_agents())
+        feed.write(f"[dim]• Active Fleet: [/dim][bold green]{active_agents}[/bold green]  [dim]| Default: [/dim][bold cyan]{agent}[/bold cyan]  [dim]| Project: [/dim][bold cyan]{pname}[/bold cyan]")
         feed.write(f"[bold green]• 🧠 First Responder Brain:[/bold green] [bold cyan]{self.brain.mode_description}[/bold cyan]")
         feed.write("[dim]• Direct answers for questions. Autonomous delegation for coding tasks.[/dim]")
         feed.write("[dim]• Press Ctrl+H for History. Console tab shows raw subagent logs.[/dim]")
@@ -612,6 +614,26 @@ class SuperagentApp(App):
             else:
                 feed.write("[yellow]Usage: :fr codex  OR  :fr agy[/yellow]\n")
 
+        elif cmd in (":agents", ":agent"):
+            if len(parts) >= 3 and parts[1] in ("enable", "disable"):
+                action = parts[1]
+                target = parts[2].lower()
+                enabled = (action == "enable")
+                if self.cfg.set_agent_enabled(target, enabled):
+                    avail = self.cfg.get_enabled_agents()
+                    self.brain.set_available_agents(avail)
+                    state = "ENABLED" if enabled else "DISABLED"
+                    feed.write(f"[bold green]✔ Agent '{target.upper()}' is now {state}. Active fleet: {', '.join(a.upper() for a in avail)}[/bold green]\n")
+                else:
+                    feed.write(f"[red]Unknown agent '{target}'. Known agents: codex, agy, claude[/red]\n")
+            else:
+                feed.write("\n[bold cyan]Fleet Agent Subscription Status:[/bold cyan]")
+                for name, spec in self.cfg._data.get("agents", {}).items():
+                    enabled = spec.get("enabled", True)
+                    status_badge = "[bold green]ENABLED[/bold green]" if enabled else "[dim red]DISABLED[/dim red]"
+                    feed.write(f"  • [bold white]{name.upper():<8}[/bold white] - {status_badge} ({spec.get('description', '')})")
+                feed.write("[dim]Use ':agent disable claude' or ':agent enable claude' to manage active fleet.[/dim]\n")
+
         elif cmd == ":clear":
             self.action_clear_finished()
 
@@ -624,7 +646,10 @@ class SuperagentApp(App):
             feed.write("\n[bold cyan]SuperAgent Commands:[/bold cyan]")
             feed.write("  @codex <task>      - Delegate task to OpenAI Codex CLI")
             feed.write("  @agy <task>        - Delegate task to Google Antigravity CLI")
-            feed.write("  @claude <task>     - Delegate task to Anthropic Claude Code")
+            feed.write("  @claude <task>     - Delegate task to Anthropic Claude Code (if enabled)")
+            feed.write("  :agents            - View fleet agents & subscription status")
+            feed.write("  :agent enable <ag> - Enable an agent (e.g. :agent enable codex)")
+            feed.write("  :agent disable <ag>- Disable an agent (e.g. :agent disable claude)")
             feed.write("  :history (or :h)   - View conversation & task history (or Ctrl+H)")
             feed.write("  :key <api-key>     - Set Gemini API key for integrated brain")
             feed.write("  :projects          - List all configured projects")

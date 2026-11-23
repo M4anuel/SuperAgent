@@ -27,6 +27,17 @@ def test_config_registry(tmp_path):
     assert cfg.set_active_project("test-repo") is True
     assert cfg.active_project.name == "test-repo"
 
+    # Agent enabled/disabled
+    cfg._data["agents"] = {
+        "codex": {"enabled": True},
+        "claude": {"enabled": False},
+        "agy": {"enabled": True}
+    }
+    assert "codex" in cfg.get_enabled_agents()
+    assert "claude" not in cfg.get_enabled_agents()
+    cfg.set_agent_enabled("claude", True)
+    assert "claude" in cfg.get_enabled_agents()
+
 def test_task_record_timer():
     record = TaskRecord(
         task_id="test1",
@@ -89,6 +100,12 @@ async def test_brain_triage():
     assert len(res6.tasks) == 1
     assert res6.tasks[0].agent == "agy"
     assert res6.tasks[0].effort == "low"
+
+    # 6. disabled agent routing
+    brain.set_available_agents(["codex", "agy"])
+    res_disabled = await brain.triage("@claude review something", proj)
+    assert res_disabled.action == "reply"
+    assert "disabled" in res_disabled.reply_text.lower()
 
 def test_runner_agents_md_injection(tmp_path):
     agents_file = tmp_path / "AGENTS.md"

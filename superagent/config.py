@@ -23,17 +23,20 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "codex": {
             "cmd": "codex",
             "args_template": ["exec", "--skip-git-repo-check", "-C", "{cwd}", "{task}"],
-            "description": "OpenAI Codex / ChatGPT CLI"
+            "description": "OpenAI Codex / ChatGPT CLI",
+            "enabled": True
         },
         "claude": {
             "cmd": "claude",
             "args_template": ["-p", "{task}"],
-            "description": "Anthropic Claude Code CLI"
+            "description": "Anthropic Claude Code CLI",
+            "enabled": False
         },
         "agy": {
             "cmd": "agy",
             "args_template": ["run", "{task}"],
-            "description": "Google Antigravity CLI"
+            "description": "Google Antigravity CLI",
+            "enabled": True
         }
     }
 }
@@ -95,6 +98,19 @@ class SuperagentConfig:
     def set_gemini_api_key(self, key: str) -> None:
         self._data["gemini_api_key"] = key.strip()
         self.save()
+
+    def get_enabled_agents(self) -> List[str]:
+        agents_dict = self._data.get("agents", {})
+        enabled = [name.lower() for name, spec in agents_dict.items() if spec.get("enabled", True)]
+        return enabled if enabled else ["codex", "agy"]
+
+    def set_agent_enabled(self, agent_name: str, enabled: bool) -> bool:
+        agent_key = agent_name.lower().strip()
+        if agent_key in self._data.get("agents", {}):
+            self._data["agents"][agent_key]["enabled"] = enabled
+            self.save()
+            return True
+        return False
 
     @property
     def active_project(self) -> Optional[ProjectConfig]:

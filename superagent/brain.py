@@ -79,9 +79,15 @@ Your responsibilities:
 class SuperagentBrain:
     """SuperAgent Brain that supports both Gemini API and subscription-backed CLI First Responders (Codex / Antigravity)."""
 
-    def __init__(self, api_key: Optional[str] = None, first_responder: str = "codex"):
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        first_responder: str = "codex",
+        available_agents: Optional[List[str]] = None
+    ):
         self.api_key = api_key or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
         self.first_responder = first_responder.lower()  # "codex" or "agy"
+        self.available_agents = [a.lower().strip() for a in (available_agents or ["codex", "agy"])]
         self.client: Optional[genai.Client] = None
 
         if HAVE_GEMINI and self.api_key:
@@ -89,6 +95,37 @@ class SuperagentBrain:
                 self.client = genai.Client(api_key=self.api_key)
             except Exception:
                 self.client = None
+
+    def set_available_agents(self, agents: List[str]) -> None:
+        cleaned = [a.lower().strip() for a in agents if a.strip()]
+        self.available_agents = cleaned if cleaned else ["codex"]
+
+    def get_system_instruction(self) -> str:
+        capabilities_map = {
+            "codex": "- `codex`: OpenAI Codex CLI (ChatGPT Plus). Best for deep Python, backend logic, refactors, algorithms, test runs.",
+            "agy": "- `agy`: Google Antigravity CLI (Google AI Pro). Best for full-stack exploration, frontend/TypeScript, file auditing, fast passes.",
+            "claude": "- `claude`: Anthropic Claude Code CLI. Best for architectural edge cases, clean typing, refactoring.",
+        }
+        fleet_desc = "\n".join(capabilities_map[a] for a in self.available_agents if a in capabilities_map)
+        agent_names = ", ".join(self.available_agents)
+        return (
+            "You are SuperAgent, the intelligent coordinator and First Responder for a fleet of subscription-backed coding CLIs:\n"
+            f"{fleet_desc}\n\n"
+            "Your responsibilities:\n"
+            "1. Direct Conversation (action='reply'):\n"
+            "   If the prompt is conversational, an explanation, a question about the project, or a confirmation:\n"
+            "   - Set action = 'reply' and supply the direct response in reply_text. Do NOT delegate.\n\n"
+            "2. Delegation (action='delegate'):\n"
+            "   If the prompt asks for code changes, bug fixes, testing, or auditing:\n"
+            f"   - IMPORTANT: Only delegate to active fleet agents: {agent_names}. Never use disabled or unavailable agents.\n"
+            "   - If the user asks for multiple agents (e.g. 'spawn 2 subagents to review...'), create MULTIPLE tasks in the `tasks` array!\n"
+            "   - For each task, choose:\n"
+            f"     * `agent`: one of [{agent_names}].\n"
+            "     * `effort`: 'low' (quick typo/syntax), 'medium' (standard features/audits), 'high' (deep architectural refactors).\n"
+            "     * `title`: short 2-4 word summary.\n"
+            "     * `task_brief`: clear, self-contained instruction for that worker.\n"
+            "   - Set `reasoning`: 1 sentence explaining the multi-agent plan.\n"
+        )
 
     @property
     def is_gemini_active(self) -> bool:
@@ -174,6 +211,15 @@ class SuperagentBrain:
             target_agent = "agy" if target_raw in ("agy", "antigravity") else target_raw
             effort = agent_match.group(2).lower() if agent_match.group(2) else "medium"
             task_brief = agent_match.group(3).strip()
+
+            if target_agent not in self.available_agents:
+                avail_str = ", ".join(f"@{a}" for a in self.available_agents)
+                return TriageDecision(
+                    action="reply",
+                    reply_text=f"'{target_agent.upper()}' CLI is disabled or not subscribed.\nActive fleet agents: {avail_str}. (You can enable it if subscribed via ':agent enable {target_agent}')",
+                    reasoning=f"Agent '{target_agent}' is not enabled in fleet."
+                )
+
             return TriageDecision(
                 action="delegate",
                 tasks=[SubtaskItem(
@@ -258,24 +304,28 @@ class SuperagentBrain:
         wants_three = "3" in lower or "three" in lower
 
         if is_broad:
+            primary = "codex" if "codex" in self.available_agents else self.available_agents[0]
+            secondary = "agy" if "agy" in self.available_agents else primary
+
             tasks = [
                 SubtaskItem(
-                    agent="codex",
+                    agent=primary,
                     effort=effort,
                     title="Backend Architecture & Logic Audit",
                     task_brief=f"Focus on backend logic, data models, edge cases, and test suites: {clean}"
                 ),
                 SubtaskItem(
-                    agent="agy" if shutil.which("agy") else "codex",
+                    agent=secondary,
                     effort=effort,
                     title="Frontend & Workflow Audit",
                     task_brief=f"Focus on frontend components, user workflows, and UI suggestions: {clean}"
                 )
             ]
             if wants_three:
+                third_agent = "claude" if "claude" in self.available_agents and shutil.which("claude") else primary
                 tasks.append(
                     SubtaskItem(
-                        agent="claude" if shutil.which("claude") else "codex",
+                        agent=third_agent,
                         effort=effort,
                         title="Code Refactoring & Security Audit",
                         task_brief=f"Focus on code style, typing, security, and refactoring: {clean}"
@@ -287,15 +337,16 @@ class SuperagentBrain:
                 reasoning=f"Decomposed into {len(tasks)} parallel subagents for complementary audit."
             )
 
+        fallback_agent = default_agent if default_agent in self.available_agents else self.available_agents[0]
         return TriageDecision(
             action="delegate",
             tasks=[SubtaskItem(
-                agent=default_agent,
+                agent=fallback_agent,
                 effort=effort,
                 title=clean[:30],
                 task_brief=clean
             )],
-            reasoning=f"Routed to default agent {default_agent.upper()}."
+            reasoning=f"Routed to default agent {fallback_agent.upper()}."
         )
 
     async def _run_planning_model(self, prompt: str, project_context: Dict[str, Any]) -> TriageDecision:
@@ -317,7 +368,7 @@ class SuperagentBrain:
                     model="gemini-2.5-flash",
                     contents=prompt_with_context,
                     config=types.GenerateContentConfig(
-                        system_instruction=SYSTEM_TRIAGE_INSTRUCTION,
+                        system_instruction=self.get_system_instruction(),
                         response_mime_type="application/json",
                         response_schema=TriageDecision,
                         temperature=0.2,
@@ -330,22 +381,30 @@ class SuperagentBrain:
                 pass
 
         # 2. Subscription Mode: Use the Planning Model via CLI (agy or codex)
+        capabilities_map = {
+            "codex": "- codex: Backend logic, Python, database models, security, test suites, algorithms.",
+            "agy": "- agy: Frontend UI, TypeScript, React components, client state, responsive design, workflows.",
+            "claude": "- claude: Refactoring, type-checking, architecture edge cases.",
+        }
+        fleet_desc = "\n".join(capabilities_map[a] for a in self.available_agents if a in capabilities_map)
+        agent_names = ", ".join(self.available_agents)
+        agents_choice = "|".join(self.available_agents)
+
         planning_prompt = (
             "You are the SuperAgent Planning Model and fleet coordinator.\n"
             f"Active Project: {project_context.get('name', 'unknown')}\n"
             f"Project Guidelines Context:\n{project_notes}\n\n"
             f"User Goal: {prompt}\n\n"
-            "Fleet Capabilities:\n"
-            "- codex: Backend logic, Python, database models, security, test suites, algorithms.\n"
-            "- agy: Frontend UI, TypeScript, React components, client state, responsive design, workflows.\n"
-            "- claude: Refactoring, type-checking, architecture edge cases.\n\n"
+            f"Available Fleet Capabilities ({agent_names}):\n"
+            f"{fleet_desc}\n\n"
             "Instructions:\n"
+            f"- IMPORTANT: Only use available fleet agents: {agent_names}. Do NOT delegate to any other agent.\n"
             "- If the task is focused on a single domain or straightforward, output 1 subagent task.\n"
             "- If the task is complex, multi-domain, full-stack, or broad audit/review/testing, decompose it into 2 or more complementary subagent tasks running in parallel across the fleet.\n"
             "- If the user specifies a number of subagents or tasks (e.g. 'spawn 2 subagents', 'spawn 3 subagents'), respect their request and output that number of DELEGATE lines for complementary fleet agents.\n"
             "- Format strictly as:\n"
             "PLAN: <1-sentence overview of coordination strategy>\n"
-            "DELEGATE: <agent: codex|agy|claude> | effort: <low|medium|high> | <actionable task brief>\n"
+            f"DELEGATE: <agent: {agents_choice}> | effort: <low|medium|high> | <actionable task brief>\n"
         )
 
         cwd = project_context.get("path") or os.getcwd()
@@ -396,8 +455,8 @@ class SuperagentBrain:
                         effort = parts[1].replace("effort:", "").replace("*", "").replace("`", "").strip().lower()
                     task_brief = parts[2].replace("*", "").replace("`", "").strip() if len(parts) > 2 else prompt
 
-                    if agent not in ("codex", "agy", "claude"):
-                        agent = default_agent
+                    if agent not in self.available_agents:
+                        agent = default_agent if default_agent in self.available_agents else self.available_agents[0]
                     if effort not in ("low", "medium", "high"):
                         effort = "medium"
 
