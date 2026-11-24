@@ -111,12 +111,20 @@ class HistoryManager:
     # --- Conversation CRUD ---
 
     def save_conversation(self, conv: Conversation) -> None:
+        path = self._conv_path(conv.id)
+        temp_file = path.with_suffix(f".tmp.{os.getpid()}")
         try:
-            path = self._conv_path(conv.id)
-            with open(path, "w", encoding="utf-8") as f:
+            with open(temp_file, "w", encoding="utf-8") as f:
                 f.write(conv.model_dump_json(indent=2))
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temp_file, path)
         except Exception:
-            pass
+            if temp_file.exists():
+                try:
+                    temp_file.unlink()
+                except Exception:
+                    pass
 
     def get_conversation(self, conv_id: str) -> Optional[Conversation]:
         path = self._conv_path(conv_id)
@@ -192,12 +200,20 @@ class HistoryManager:
     # --- Turn CRUD (legacy and individual turn lookup) ---
 
     def save_turn(self, item: HistoryItem) -> None:
+        path = self._file_path(item.id)
+        temp_file = path.with_suffix(f".tmp.{os.getpid()}")
         try:
-            path = self._file_path(item.id)
-            with open(path, "w", encoding="utf-8") as f:
+            with open(temp_file, "w", encoding="utf-8") as f:
                 f.write(item.model_dump_json(indent=2))
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temp_file, path)
         except Exception:
-            pass
+            if temp_file.exists():
+                try:
+                    temp_file.unlink()
+                except Exception:
+                    pass
 
     def get_turn(self, item_id: str) -> Optional[HistoryItem]:
         path = self._file_path(item_id)

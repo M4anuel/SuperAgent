@@ -7,6 +7,8 @@ import shutil
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Callable
 from pydantic import BaseModel, Field
+from superagent.execution import agent_command, validate_project_path
+from superagent.processes import ProcessSupervisor
 
 try:
     from google import genai
@@ -73,6 +75,11 @@ Your responsibilities:
      * `effort`: 'low' (quick typo/syntax), 'medium' (standard features/audits), 'high' (deep architectural refactors).
      * `title`: short 2-4 word summary.
      * `task_brief`: clear, self-contained instruction for that worker.
+   - SMART TASK SLICING & DOMAIN ISOLATION:
+     * If user gives multiple tasks (e.g. 4 tasks across 2 agents), prepare a clear plan checklist.
+     * Give each parallel subagent strictly non-overlapping files/modules (e.g. backend vs frontend).
+     * Never command parallel agents to edit the same shared tracker or file at the same time.
+     * Keep tasks atomic so workers finish in 2-4 minutes without timeouts.
    - Set `reasoning`: 1 sentence explaining the multi-agent plan.
 """
 
@@ -89,6 +96,7 @@ class SuperagentBrain:
         self.first_responder = first_responder.lower().strip()
         self.available_agents = [a.lower().strip() for a in available_agents] if available_agents is not None else ["codex", "agy"]
         self.client: Optional[genai.Client] = None
+        self.supervisor = ProcessSupervisor()
 
         if HAVE_GEMINI and self.api_key:
             try:
@@ -124,6 +132,7 @@ class SuperagentBrain:
             "     * `effort`: 'low' (quick typo/syntax), 'medium' (standard features/audits), 'high' (deep architectural refactors).\n"
             "     * `title`: short 2-4 word summary.\n"
             "     * `task_brief`: clear, self-contained instruction for that worker.\n"
+            "   - SMART TASK SLICING: If the user provides multiple tasks, divide them so each parallel agent owns distinct non-overlapping files (never the same file concurrently). Keep tasks atomic so workers finish in 2-4 minutes.\n"
             "   - Set `reasoning`: 1 sentence explaining the multi-agent plan.\n"
         )
 
@@ -205,7 +214,7 @@ class SuperagentBrain:
             )
 
         # 2. Explicit agent routing: e.g. @codex:high, @agy:low, @claude
-        agent_match = re.match(r"^@(codex|agy|claude|antigravity)(?::(low|medium|high))?\s+(.*)$", clean, re.IGNORECASE)
+        agent_match = re.match(r"^@(codex|agy|claude|antigravity)(?::(low|medium|high))?\s+(.*)$", clean, re.IGNORECASE | re.DOTALL)
         if agent_match:
             target_raw = agent_match.group(1).lower()
             target_agent = "agy" if target_raw in ("agy", "antigravity") else target_raw
@@ -402,39 +411,34 @@ class SuperagentBrain:
             "- If the task is focused on a single domain or straightforward, output 1 subagent task.\n"
             "- If the task is complex, multi-domain, full-stack, or broad audit/review/testing, decompose it into 2 or more complementary subagent tasks running in parallel across the fleet.\n"
             "- If the user specifies a number of subagents or tasks (e.g. 'spawn 2 subagents', 'spawn 3 subagents'), respect their request and output that number of DELEGATE lines for complementary fleet agents.\n"
+            "- SMART TASK DECOMPOSITION & FILE ISOLATION:\n"
+            "  * If the user asks for multiple items (e.g. 4 tasks on 2 agents, or multiple priorities):\n"
+            "    1. Prepare a numbered task checklist in PLAN.\n"
+            "    2. Divide the tasks so each parallel subagent gets a strictly non-overlapping file/module domain (e.g. Agent 1 owns backend API only; Agent 2 owns frontend UI only).\n"
+            "    3. NEVER command parallel subagents to create or write to the same file or shared tracker simultaneously.\n"
+            "    4. Limit each subagent to 1-2 focused, testable tasks per turn so it finishes cleanly in 2-4 minutes without hanging.\n"
             "- Format strictly as:\n"
             "PLAN: <1-sentence overview of coordination strategy>\n"
             f"DELEGATE: <agent: {agents_choice}> | effort: <low|medium|high> | <actionable task brief>\n"
         )
 
-        cwd = project_context.get("path") or os.getcwd()
+        cwd = validate_project_path(project_context.get("path", ""))
         cli_agent = self.first_responder
 
         try:
             from superagent.runner import resolve_executable
-            if cli_agent == "agy":
-                exec_prefix = resolve_executable("agy")
-                cmd = exec_prefix + ["--dangerously-skip-permissions", "--effort", "low", "-p", planning_prompt]
-            else:
-                exec_prefix = resolve_executable("codex")
-                cmd = exec_prefix + [
-                    "exec",
-                    "--skip-git-repo-check",
-                    "--dangerously-bypass-approvals-and-sandbox",
-                    "-c", 'model_reasoning_effort="low"',
-                    "-C", cwd,
-                    planning_prompt
-                ]
-
-            proc = await asyncio.create_subprocess_exec(
+            cmd = agent_command(cli_agent, planning_prompt, cwd, 'low', 'read-only')
+            cmd = resolve_executable(cmd[0]) + cmd[1:]
+            async with self.supervisor.process(
                 *cmd,
                 cwd=cwd,
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT
-            )
-
-            stdout_bytes, _ = await asyncio.wait_for(proc.communicate(), timeout=25.0)
+            ) as proc:
+                stdout_bytes, _ = await asyncio.wait_for(proc.communicate(), timeout=25.0)
+                if proc.returncode != 0:
+                    raise RuntimeError(f'Planner exited with code {proc.returncode}')
             output = stdout_bytes.decode("utf-8", errors="replace").strip()
             lines = [l.strip() for l in output.splitlines() if l.strip()]
 
@@ -570,10 +574,10 @@ class SuperagentBrain:
                 pass
 
         # 2. Subscription Mode: Use the First Responder CLI (agy or codex) to synthesize
-        cwd = project_context.get("path") or os.getcwd()
         cli_agent = self.first_responder if self.first_responder in self.available_agents else (self.available_agents[0] if self.available_agents else None)
         if cli_agent:
             try:
+                cwd = validate_project_path(project_context.get('path', ''))
                 from superagent.runner import resolve_executable, strip_ansi
                 synthesis_prompt = (
                     "You are the SuperAgent Fleet Coordinator.\n"
@@ -586,28 +590,18 @@ class SuperagentBrain:
                     "- Highlight any modified files or next steps.\n"
                     "Output your report directly in clean Markdown without conversational preamble."
                 )
-                if cli_agent == "agy":
-                    exec_prefix = resolve_executable("agy")
-                    cmd = exec_prefix + ["--dangerously-skip-permissions", "--effort", "low", "-p", synthesis_prompt]
-                else:
-                    exec_prefix = resolve_executable("codex")
-                    cmd = exec_prefix + [
-                        "exec",
-                        "--skip-git-repo-check",
-                        "--dangerously-bypass-approvals-and-sandbox",
-                        "-c", 'model_reasoning_effort="low"',
-                        "-C", cwd,
-                        synthesis_prompt
-                    ]
-
-                proc = await asyncio.create_subprocess_exec(
+                cmd = agent_command(cli_agent, synthesis_prompt, cwd, 'low', 'read-only')
+                cmd = resolve_executable(cmd[0]) + cmd[1:]
+                async with self.supervisor.process(
                     *cmd,
                     cwd=cwd,
                     stdin=asyncio.subprocess.DEVNULL,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.STDOUT
-                )
-                stdout_bytes, _ = await asyncio.wait_for(proc.communicate(), timeout=45.0)
+                ) as proc:
+                    stdout_bytes, _ = await asyncio.wait_for(proc.communicate(), timeout=45.0)
+                    if proc.returncode != 0:
+                        raise RuntimeError(f'Synthesizer exited with code {proc.returncode}')
                 output = stdout_bytes.decode("utf-8", errors="replace").strip()
                 from superagent.runner import strip_ansi
                 raw_lines = [strip_ansi(l) for l in output.splitlines()]

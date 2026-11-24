@@ -23,6 +23,7 @@ def test_config_registry(tmp_path):
     assert projs[0].name == "test-repo"
     
     # Switch active
+    (tmp_path / 'another').mkdir()
     cfg.add_project("another-repo", str(tmp_path / "another"))
     assert cfg.set_active_project("test-repo") is True
     assert cfg.active_project.name == "test-repo"

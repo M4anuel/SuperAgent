@@ -14,7 +14,8 @@ class GitManager:
                 cwd=self.repo_path,
                 capture_output=True,
                 text=True,
-                check=False
+                check=False,
+                timeout=10,
             )
             out = res.stdout if res.returncode == 0 else (res.stderr or res.stdout)
             return res.returncode, out.strip()

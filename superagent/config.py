@@ -1,6 +1,7 @@
 from __future__ import annotations
 import json
 import os
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -9,16 +10,10 @@ CONFIG_FILE = CONFIG_DIR / "config.json"
 
 DEFAULT_CONFIG: Dict[str, Any] = {
     "version": "1.0",
-    "active_project": "betterilias",
-    "projects": {
-        "betterilias": {
-            "name": "betterilias",
-            "path": str(Path(__file__).resolve().parents[3]),  # root of current repo
-            "default_branch": "main",
-            "test_cmd": "python -m pytest tests/",
-            "default_agent": "codex",
-        }
-    },
+    "active_project": None,
+    "projects": {},
+    "execution_profile": "workspace-write",
+    "task_timeout_seconds": 1800,
     "agents": {
         "codex": {
             "cmd": "codex",
@@ -59,9 +54,9 @@ class ProjectConfig:
         }
 
 class SuperagentConfig:
-    def __init__(self):
-        self.config_dir = CONFIG_DIR
-        self.config_file = CONFIG_FILE
+    def __init__(self, config_dir: Optional[Path] = None):
+        self.config_dir = Path(config_dir) if config_dir is not None else CONFIG_DIR
+        self.config_file = self.config_dir / "config.json"
         self._data: Dict[str, Any] = {}
         self.load()
 
@@ -72,16 +67,43 @@ class SuperagentConfig:
                 with open(self.config_file, "r", encoding="utf-8") as f:
                     self._data = json.load(f)
             except Exception:
-                self._data = DEFAULT_CONFIG.copy()
+                self._data = deepcopy(DEFAULT_CONFIG)
                 self.save()
         else:
-            self._data = DEFAULT_CONFIG.copy()
+            self._data = deepcopy(DEFAULT_CONFIG)
             self.save()
 
     def save(self) -> None:
         self.config_dir.mkdir(parents=True, exist_ok=True)
-        with open(self.config_file, "w", encoding="utf-8") as f:
-            json.dump(self._data, f, indent=2)
+        temp_file = self.config_file.with_suffix(f".tmp.{os.getpid()}")
+        try:
+            with open(temp_file, "w", encoding="utf-8") as f:
+                json.dump(self._data, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temp_file, self.config_file)
+        except Exception:
+            if temp_file.exists():
+                try:
+                    temp_file.unlink()
+                except Exception:
+                    pass
+            raise
+
+    @property
+    def execution_profile(self) -> str:
+        from superagent.execution import PROFILES
+        profile = self._data.get('execution_profile', 'workspace-write')
+        if profile not in PROFILES:
+            raise ValueError(f'Unknown execution profile: {profile}')
+        return profile
+
+    @property
+    def task_timeout_seconds(self) -> float:
+        value = float(self._data.get('task_timeout_seconds', 1800))
+        if not 0 < value < float('inf'):
+            raise ValueError('Task timeout must be positive and finite.')
+        return value
 
     @property
     def first_responder(self) -> str:
@@ -148,6 +170,8 @@ class SuperagentConfig:
         return [ProjectConfig(v) for v in self._data.get("projects", {}).values()]
 
     def add_project(self, name: str, path: str, test_cmd: str = "", default_agent: str = "codex") -> ProjectConfig:
+        from superagent.execution import validate_project_path
+        path = validate_project_path(path)
         p_dict = {
             "name": name,
             "path": str(Path(path).resolve()),
@@ -171,11 +195,12 @@ class SuperagentConfig:
 
     def detect_project(self, cwd: Optional[str] = None) -> Optional[ProjectConfig]:
         current = Path(cwd or os.getcwd()).resolve()
+        matches = []
         for p in self.list_projects():
             try:
                 proj_path = Path(p.path).resolve()
-                if current == proj_path or proj_path in current.parents:
-                    return p
+                if proj_path.is_dir() and (current == proj_path or proj_path in current.parents):
+                    matches.append((len(proj_path.parts), p))
             except Exception:
                 continue
-        return None
+        return max(matches, key=lambda match: match[0])[1] if matches else None

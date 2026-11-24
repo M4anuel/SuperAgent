@@ -9,6 +9,12 @@ from superagent.config import SuperagentConfig
 from superagent.runner import SubagentRunner
 
 def main() -> None:
+    # Redirected Windows streams may default to CP1252 even though agent output
+    # and project names contain Unicode. Match the UTF-8 subprocess protocol.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+
     parser = argparse.ArgumentParser(
         prog="superagent",
         description="SuperAgent: Coordinate Claude Code, Codex, and Antigravity across multiple projects."
@@ -26,6 +32,9 @@ def main() -> None:
     run_parser.add_argument("agent", choices=["claude", "codex", "agy", "antigravity"], help="Agent to delegate to")
     run_parser.add_argument("task", help="Instruction or task description")
     run_parser.add_argument("--project", "-p", help="Target project name (defaults to active project)")
+    run_parser.add_argument('--execution-profile', choices=['read-only', 'workspace-write', 'unrestricted'],
+                            help='Worker permissions (default: config execution_profile or workspace-write)')
+    run_parser.add_argument('--timeout', type=float, help='Worker deadline in seconds')
 
     # project subcommand
     project_parser = subparsers.add_parser("project", help="Manage projects")
@@ -70,7 +79,10 @@ def main() -> None:
                 print(f" {is_active} {p.name:<18} -> {p.path} [agent: {p.default_agent}]")
             print()
         elif args.project_action == "add":
-            proj = cfg.add_project(args.name, args.path, test_cmd=args.test, default_agent=args.agent)
+            try:
+                proj = cfg.add_project(args.name, args.path, test_cmd=args.test, default_agent=args.agent)
+            except ValueError as exc:
+                parser.error(str(exc))
             print(f"Registered project '{proj.name}' -> {proj.path}")
         elif args.project_action == "remove":
             if cfg.remove_project(args.name):
@@ -92,13 +104,19 @@ def main() -> None:
             sys.exit(1)
 
         print(f"➜ Superagent delegating to {args.agent.upper()} in {proj.name} ({proj.path})...")
-        runner = SubagentRunner()
-        task = runner.create_task(
-            agent=args.agent,
-            task_desc=args.task,
-            project_name=proj.name,
-            cwd=proj.path
-        )
+        try:
+            profile = args.execution_profile or getattr(cfg, 'execution_profile', 'workspace-write')
+            timeout = args.timeout if args.timeout is not None else getattr(cfg, 'task_timeout_seconds', 1800)
+            runner = SubagentRunner(execution_profile=profile, task_timeout=timeout)
+            print(f'Execution profile: {profile}; worker timeout: {timeout:g}s; coordinator: read-only')
+            task = runner.create_task(
+                agent=args.agent,
+                task_desc=args.task,
+                project_name=proj.name,
+                cwd=proj.path
+            )
+        except ValueError as exc:
+            parser.error(str(exc))
 
         def print_log(t, event):
             if event == "log" and t.log_lines:

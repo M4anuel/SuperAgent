@@ -1,5 +1,6 @@
 from __future__ import annotations
 import asyncio
+import codecs
 import os
 import re
 import shutil
@@ -7,6 +8,8 @@ import time
 import uuid
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
+from superagent.execution import agent_command, validate_project_path
+from superagent.processes import ProcessSupervisor
 
 ANSI_REGEX = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]')
 
@@ -71,6 +74,9 @@ class TaskRecord:
         self.diff_summary: Optional[str] = None
         self.error_summary: Optional[str] = None
         self._process: Optional[asyncio.subprocess.Process] = None
+        self._execution_task: Optional[asyncio.Task] = None
+        self.execution_profile = 'workspace-write'
+        self._cancel_requested = False
 
     @property
     def elapsed_seconds(self) -> int:
@@ -113,7 +119,12 @@ class TaskRecord:
         return "\n".join(filtered).strip()
 
 class SubagentRunner:
-    def __init__(self):
+    def __init__(self, execution_profile: str = 'workspace-write', task_timeout: float = 1800):
+        if not 0 < task_timeout < float('inf'):
+            raise ValueError('Task timeout must be positive and finite.')
+        self.execution_profile = execution_profile
+        self.task_timeout = task_timeout
+        self.supervisor = ProcessSupervisor()
         self.tasks: Dict[str, TaskRecord] = {}
         self.subscribers: List[Callable[[TaskRecord, str], None]] = []
 
@@ -137,33 +148,24 @@ class SubagentRunner:
         effort: str = "medium",
         custom_cmd: Optional[List[str]] = None
     ) -> TaskRecord:
+        cwd = validate_project_path(cwd)
         task_id = str(uuid.uuid4())[:8]
 
-        # Contextual prompt: prepend AGENTS.md reminder if present in repo
-        agents_file = Path(cwd) / "AGENTS.md"
-        prompt_with_rules = f"[Follow AGENTS.md in repo] {task_desc}" if agents_file.exists() else task_desc
+        # Contextual prompt: prepend guidelines reminder and boundary containment
+        directives: List[str] = []
+        if (Path(cwd) / "SUPERAGENT.md").exists():
+            directives.append("[Follow SUPERAGENT.md in repo]")
+        if (Path(cwd) / "AGENTS.md").exists():
+            directives.append("[Follow AGENTS.md in repo]")
+        directives.append(f"[Remain strictly inside repository root: {cwd}]")
+        prefix = f"{' '.join(directives)} "
+        prompt_with_rules = f"{prefix}{task_desc}"
 
         # Resolve command based on agent
         if custom_cmd:
             cmd = custom_cmd
         else:
-            if agent.lower() == "claude":
-                cmd = ["claude", "-p", prompt_with_rules]
-            elif agent.lower() == "codex":
-                # Codex CLI with adaptive reasoning effort and bypassed approval prompts
-                cmd = [
-                    "codex", "exec",
-                    "--skip-git-repo-check",
-                    "--dangerously-bypass-approvals-and-sandbox",
-                    "-c", f'model_reasoning_effort="{effort}"',
-                    "-C", cwd,
-                    prompt_with_rules
-                ]
-            elif agent.lower() in ("agy", "antigravity"):
-                cmd = ["agy", "--dangerously-skip-permissions", "--effort", effort, "-p", prompt_with_rules]
-            else:
-                # Default fallback
-                cmd = [agent, prompt_with_rules]
+            cmd = agent_command(agent, prompt_with_rules, cwd, effort, self.execution_profile)
 
         record = TaskRecord(
             task_id=task_id,
@@ -174,73 +176,107 @@ class SubagentRunner:
             cmd=cmd,
             effort=effort
         )
+        record.execution_profile = 'custom-command' if custom_cmd else self.execution_profile
         self.tasks[task_id] = record
         self._notify(record, "new")
         return record
 
     async def execute_task(self, task: TaskRecord) -> None:
+        if task.status != 'QUEUED':
+            return
+        task._execution_task = asyncio.current_task()
         task.status = "RUNNING"
         task.start_time = time.time()
         self._notify(task, "status")
 
-        # Resolve binary to avoid Windows cmd.exe / quoting syntax errors
-        exec_prefix = resolve_executable(task.cmd[0])
-        actual_args = exec_prefix + task.cmd[1:]
-
         try:
-            task._process = await asyncio.create_subprocess_exec(
-                *actual_args,
-                cwd=task.cwd,
-                stdin=asyncio.subprocess.DEVNULL,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-                env=os.environ.copy()
-            )
-
-            while True:
-                line_bytes = await task._process.stdout.readline()
-                if not line_bytes:
-                    break
-                line = line_bytes.decode("utf-8", errors="replace").rstrip()
-                task.log_lines.append(line)
-                self._notify(task, "log")
-
-            await task._process.wait()
-            task.returncode = task._process.returncode
-            task.end_time = time.time()
-
+            await asyncio.wait_for(self._run_process(task), timeout=self.task_timeout)
             if task.status != "CANCELLED":
                 task.status = "DONE" if task.returncode == 0 else "FAILED"
                 try:
                     from superagent.git_utils import GitManager
                     gm = GitManager(task.cwd)
-                    if gm.is_git_repo():
-                        task.diff_summary = gm.get_uncommitted_diff_stat() or gm.get_status_short()
+                    if await asyncio.to_thread(gm.is_git_repo):
+                        task.diff_summary = (await asyncio.to_thread(gm.get_uncommitted_diff_stat)
+                                             or await asyncio.to_thread(gm.get_status_short))
                 except Exception:
                     pass
                 if task.status == "FAILED" and task.log_lines:
                     non_empty = [l for l in task.log_lines if l.strip()]
                     task.error_summary = "\n".join(non_empty[-5:])
+        except asyncio.CancelledError:
+            task.status = 'CANCELLED'
+            raise
+        except asyncio.TimeoutError:
+            task.status = 'FAILED'
+            task.error_summary = f'Task timed out after {self.task_timeout:g} seconds.'
+            task.log_lines.append(task.error_summary)
+        except Exception as e:
+            err_msg = f"[Superagent Error] {task.agent}: {str(e)}"
+            task.log_lines.append(err_msg)
+            task.error_summary = err_msg
+            if task.status != 'CANCELLED':
+                task.status = "FAILED"
+        finally:
+            if task._process is not None:
+                task.returncode = task._process.returncode
+            task._process = None
+            task._execution_task = None
+            task.end_time = time.time()
             self._notify(task, "status")
 
-        except Exception as e:
-            err_msg = f"[Superagent Error] Failed to launch {task.agent}: {str(e)}"
-            task.log_lines.append(err_msg)
-            task.end_time = time.time()
-            task.status = "FAILED"
-            self._notify(task, "status")
+    async def _run_process(self, task: TaskRecord) -> None:
+        # Revalidate stored project paths immediately before launching.
+        validate_project_path(task.cwd)
+        actual_args = resolve_executable(task.cmd[0]) + task.cmd[1:]
+        async with self.supervisor.process(
+            *actual_args, cwd=task.cwd, stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+            env=os.environ.copy(),
+        ) as proc:
+            task._process = proc
+            decoder = codecs.getincrementaldecoder('utf-8')(errors='replace')
+            pending = ''
+            while True:
+                chunk = await proc.stdout.read(16384)
+                pending += decoder.decode(chunk, final=not chunk)
+                while '\n' in pending or len(pending) >= 65536:
+                    split = pending.find('\n')
+                    if split < 0:
+                        split = 65536
+                        line, pending = pending[:split], pending[split:]
+                    else:
+                        line, pending = pending[:split], pending[split + 1:]
+                    task.log_lines.append(line.rstrip('\r'))
+                    self._notify(task, 'log')
+                if not chunk:
+                    break
+            if pending:
+                task.log_lines.append(pending.rstrip('\r'))
+                self._notify(task, 'log')
+            await proc.wait()
+            task.returncode = proc.returncode
 
     def cancel_task(self, task_id: str) -> bool:
         task = self.tasks.get(task_id)
         if not task:
             return False
-        if task._process and task._process.returncode is None:
-            try:
-                task._process.terminate()
-            except Exception:
-                pass
-            task.status = "CANCELLED"
-            task.end_time = time.time()
+        if task.status in ('QUEUED', 'RUNNING', 'TESTING'):
+            if task._cancel_requested:
+                return False
+            task._cancel_requested = True
+            if task._execution_task:
+                task._execution_task.cancel()
+            else:
+                task.status = 'CANCELLED'
+                task.end_time = time.time()
             self._notify(task, "status")
             return True
         return False
+
+    async def aclose(self) -> None:
+        executions = [t._execution_task for t in self.tasks.values() if t._execution_task]
+        for task_id in list(self.tasks):
+            self.cancel_task(task_id)
+        await asyncio.gather(*executions, return_exceptions=True)
+        await self.supervisor.aclose()

@@ -9,7 +9,7 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Container, Horizontal, Vertical, VerticalScroll
 from textual.message import Message
-from textual.widgets import Footer, Header, Input, Label, RichLog, Static, TabbedContent, TabPane, OptionList
+from textual.widgets import Footer, Header, TextArea, Label, RichLog, Static, TabbedContent, TabPane, OptionList
 from textual.widgets.option_list import Option
 from rich.markup import escape
 from rich.text import Text
@@ -19,6 +19,7 @@ from superagent.config import SuperagentConfig, ProjectConfig
 from superagent.git_utils import GitManager
 from superagent.history import HistoryManager, HistoryItem, Conversation, SubtaskRecordData
 from superagent.runner import SubagentRunner, TaskRecord
+from superagent.execution import validate_project_path
 from superagent.tui.cards import SubagentCard, THROBBER_FRAMES
 
 APP_CSS = """
@@ -121,12 +122,14 @@ RichLog {
 
 #input-container {
     dock: bottom;
-    height: 4;
+    height: auto;
     padding: 0 1;
     margin-bottom: 1;
 }
 
 #prompt-input {
+    height: 3;
+    max-height: 8;
     border: heavy $accent;
 }
 
@@ -143,6 +146,40 @@ SubagentCard:focus {
     background: $surface;
 }
 """
+
+class PromptInput(TextArea):
+    """Multiline prompt: Enter sends; Shift+Enter inserts a newline."""
+
+    BINDINGS = [
+        Binding("enter", "submit", "Send", priority=True),
+        Binding("shift+enter,ctrl+j", "newline", "New line", priority=True),
+        Binding("ctrl+k", "app.cancel_active", "Cancel Task", priority=True),
+        Binding("ctrl+y", "app.copy_active_log", "Copy Log", priority=True),
+    ]
+
+    class Submitted(Message):
+        def __init__(self, input: "PromptInput", value: str) -> None:
+            super().__init__()
+            self.input = input
+            self.value = value
+
+    @property
+    def value(self) -> str:
+        return self.text
+
+    @value.setter
+    def value(self, value: str) -> None:
+        self.load_text(value)
+
+    def action_submit(self) -> None:
+        self.post_message(self.Submitted(self, self.text))
+
+    def action_newline(self) -> None:
+        self.replace("\n", *self.selection)
+
+    def on_text_area_changed(self, event: TextArea.Changed) -> None:
+        self.styles.height = min(6, max(1, self.text.count("\n") + 1)) + 2
+
 
 class RunnerEvent(Message):
     """Thread-safe event from SubagentRunner dispatched to Textual."""
@@ -214,10 +251,13 @@ class SuperagentApp(App):
             available_agents=self.cfg.get_enabled_agents()
         )
         self.history = HistoryManager()
-        self.runner = SubagentRunner()
+        self.runner = SubagentRunner(execution_profile=self.cfg.execution_profile,
+                                     task_timeout=self.cfg.task_timeout_seconds)
         self.active_task_id: Optional[str] = None
         self.card_widgets: Dict[str, SubagentCard] = {}
         self._status_frame_idx = 0
+        self._retry_request = None
+        self._log_page_end = None
         self.start_new_conversation_flag = start_new_conversation
         self.current_conversation: Optional[Conversation] = None
         
@@ -245,13 +285,13 @@ class SuperagentApp(App):
                         yield RichLog(id="superagent-feed", highlight=True, markup=True, wrap=True)
                         yield Static("[dim]⚡ Fleet idle • Standing by for next instruction[/dim]", id="feed-status-bar")
                     with TabPane("💻 Subagent Console", id="tab-console"):
-                        yield RichLog(id="subagent-log", highlight=False, markup=False, wrap=True)
+                        yield RichLog(id="subagent-log", max_lines=2000, highlight=False, markup=False, wrap=True)
                     with TabPane("📜 History", id="tab-history"):
                         yield Label("📜 CONVERSATION HISTORY  •  Select with ↑/↓ and press ENTER to resume in Feed", id="history-header")
                         yield OptionList(id="history-conversations-list")
 
         with Container(id="input-container"):
-            yield Input(
+            yield PromptInput(
                 placeholder="Ask Superagent: '@codex <task>', '@agy <task>', or ':help'",
                 id="prompt-input"
             )
@@ -281,7 +321,7 @@ class SuperagentApp(App):
         self.set_interval(0.25, self._update_active_status_bar)
 
         # Focus input
-        self.query_one("#prompt-input", Input).focus()
+        self.query_one("#prompt-input", PromptInput).focus()
 
     def _render_conversation_in_feed(self, conv: Optional[Conversation]) -> None:
         feed = self.query_one("#superagent-feed", RichLog)
@@ -458,7 +498,7 @@ class SuperagentApp(App):
             tabs.active = "tab-superagent"
             feed = self.query_one("#superagent-feed", RichLog)
             feed.write(f"[bold green]✔ Resumed conversation '{escape(conv.title)}' ({conv.turn_count} turn(s))[/bold green]\n")
-            self.query_one("#prompt-input", Input).focus()
+            self.query_one("#prompt-input", PromptInput).focus()
             self.refresh_history_tab()
 
     def _render_banner(self) -> str:
@@ -491,7 +531,7 @@ class SuperagentApp(App):
             if not target_id and self.runner.tasks:
                 target_id = next(reversed(self.runner.tasks))
             if target_id:
-                self.select_task(target_id)
+                self.select_task(target_id, page_end=self._log_page_end)
         elif pane_id == "tab-history":
             self.refresh_history_tab()
 
@@ -517,7 +557,7 @@ class SuperagentApp(App):
 
         elif event == "log":
             # If this is the currently selected task, append to Subagent Console RichLog
-            if self.active_task_id == task.task_id and task.log_lines:
+            if self.active_task_id == task.task_id and task.log_lines and self._log_page_end is None:
                 log_widget = self.query_one("#subagent-log", RichLog)
                 line = task.log_lines[-1]
                 log_widget.write(Text.from_ansi(line) if "\x1b" in line else line)
@@ -545,7 +585,8 @@ class SuperagentApp(App):
         tabs = self.query_one("#main-tabs", TabbedContent)
         tabs.active = "tab-console"
 
-    def select_task(self, task_id: str) -> None:
+    def select_task(self, task_id: str, *, page_end: Optional[int] = None) -> None:
+        self._log_page_end = page_end
         self.active_task_id = task_id
         for tid, card in self.card_widgets.items():
             card.is_active_selection = (tid == task_id)
@@ -569,17 +610,20 @@ class SuperagentApp(App):
             
             lines_to_write = task.log_lines or (task.clean_output.splitlines() if getattr(task, "clean_output", None) else [])
             if lines_to_write:
-                for line in lines_to_write:
-                    log_widget.write(Text.from_ansi(line) if "\x1b" in line else line)
+                end = len(lines_to_write) if page_end is None else min(page_end, len(lines_to_write))
+                start = max(0, end - 400)
+                log_widget.write(Text(f"Lines {start + 1}-{end} of {len(lines_to_write)}. :logs earlier / :logs latest; Ctrl+Y copies all.", style="dim"))
+                chunk = "\n".join(line[:4000] + (" [display truncated; Ctrl+Y copies full log]" if len(line) > 4000 else "") for line in lines_to_write[start:end])
+                log_widget.write(Text.from_ansi(chunk) if "\x1b" in chunk else Text(chunk))
             else:
                 log_widget.write("[dim]No output recorded for this task.[/dim]")
 
-    async def on_input_submitted(self, message: Input.Submitted) -> None:
+    async def on_prompt_input_submitted(self, message: PromptInput.Submitted) -> None:
         prompt = message.value.strip()
         if not prompt:
             return
 
-        message.input.clear()
+        message.input.load_text("")
         
         # Ensure right pane displays the SuperAgent Feed
         tabs = self.query_one("#main-tabs", TabbedContent)
@@ -603,10 +647,28 @@ class SuperagentApp(App):
         feed.write("[dim]⏳ SuperAgent First Responder evaluating task...[/dim]")
 
         # 2. Process triage in a background async task so UI never freezes
-        asyncio.create_task(self._process_user_task(prompt, proj))
+        self.runner.supervisor.track(self._process_user_task(prompt, proj))
 
     async def _process_user_task(self, prompt: str, proj: ProjectConfig) -> None:
+        conversation_id = self.current_conversation.id if self.current_conversation else None
+        try:
+            await self._process_user_task_inner(prompt, proj)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._retry_request = (prompt, proj, conversation_id)
+            feed = self.query_one("#superagent-feed", RichLog)
+            feed.write(f"[bold red]Request failed: {escape(str(exc))}[/bold red]")
+            feed.write("[yellow]You can keep typing. Use :retry to retry this request.[/yellow]")
+            self.query_one("#prompt-input", PromptInput).focus()
+
+    async def _process_user_task_inner(self, prompt: str, proj: ProjectConfig) -> None:
         feed = self.query_one("#superagent-feed", RichLog)
+        try:
+            validate_project_path(proj.path)
+        except ValueError as exc:
+            feed.write(f"[red]{escape(str(exc))}[/red]")
+            return
 
         def report_status(msg: str) -> None:
             feed.write(f"[dim]{msg}[/dim]")
@@ -670,6 +732,7 @@ class SuperagentApp(App):
         )
 
         task_records: List[TaskRecord] = []
+        feed.write(f"[dim]Execution profile: {self.runner.execution_profile}; coordinator: read-only[/dim]")
         # Spawn each task concurrently in background!
         for idx, t in enumerate(tasks):
             task_record = self.runner.create_task(
@@ -682,10 +745,10 @@ class SuperagentApp(App):
             task_records.append(task_record)
             if idx == 0:
                 self.select_task(task_record.task_id)
-            asyncio.create_task(self.runner.execute_task(task_record))
+            self.runner.supervisor.track(self.runner.execute_task(task_record))
 
         # Launch batch monitor and planning model synthesis!
-        asyncio.create_task(self._monitor_and_synthesize_batch(turn_item, task_records, proj))
+        self.runner.supervisor.track(self._monitor_and_synthesize_batch(turn_item, task_records, proj))
 
     async def _monitor_and_synthesize_batch(
         self,
@@ -742,7 +805,30 @@ class SuperagentApp(App):
         parts = cmd_line.strip().split()
         cmd = parts[0].lower()
 
-        if cmd in (":p", ":project", ":projects"):
+        if cmd == ":retry":
+            if self._retry_request is None:
+                feed.write("[yellow]No failed request to retry.[/yellow]")
+                return
+            prompt, proj, conversation_id = self._retry_request
+            active = self.cfg.active_project
+            current_id = self.current_conversation.id if self.current_conversation else None
+            if not active or active.name != proj.name or current_id != conversation_id:
+                feed.write("[yellow]Return to the original project and conversation before retrying.[/yellow]")
+                return
+            self._retry_request = None
+            self.runner.supervisor.track(self._process_user_task(prompt, proj))
+
+        elif cmd == ":logs":
+            task = self.runner.tasks.get(self.active_task_id)
+            if task:
+                if len(parts) > 1 and parts[1] == "earlier":
+                    end = max(1, (len(task.log_lines) if self._log_page_end is None else self._log_page_end) - 400)
+                    self.select_task(task.task_id, page_end=end)
+                else:
+                    self.select_task(task.task_id)
+                self.query_one("#main-tabs", TabbedContent).active = "tab-console"
+
+        elif cmd in (":p", ":project", ":projects"):
             if len(parts) == 1:
                 # List projects
                 feed.write("\n[bold cyan]Registered Projects:[/bold cyan]")
@@ -841,6 +927,9 @@ class SuperagentApp(App):
 
         elif cmd == ":help":
             feed.write("\n[bold cyan]SuperAgent Commands:[/bold cyan]")
+            feed.write("  :retry             - Retry the last failed request")
+            feed.write("  :logs earlier/latest - Page active console output")
+            feed.write("  Enter sends; Shift+Enter (or Ctrl+J) inserts a newline")
             feed.write("  :new [title] (or :n)- Start a new conversation for this project")
             feed.write("  :title <name>      - Rename the active conversation")
             feed.write("  :history (or :h)   - Switch to History tab (or Ctrl+H)")
@@ -882,9 +971,9 @@ class SuperagentApp(App):
             scroll.mount(Static("[dim]No subagents running. Enter a task below.[/dim]", id="cards-empty-notice"))
             self.active_task_id = None
 
-    def on_unmount(self) -> None:
-        for tid in list(self.runner.tasks.keys()):
-            self.runner.cancel_task(tid)
+    async def on_unmount(self) -> None:
+        await self.runner.aclose()
+        await self.brain.supervisor.aclose()
 
     def switch_to_project(self, project_name: str) -> bool:
         if self.cfg.set_active_project(project_name):
