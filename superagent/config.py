@@ -1,6 +1,9 @@
 from __future__ import annotations
 import json
 import os
+import shutil
+import tempfile
+import warnings
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -65,13 +68,42 @@ class SuperagentConfig:
         if self.config_file.exists():
             try:
                 with open(self.config_file, "r", encoding="utf-8") as f:
-                    self._data = json.load(f)
-            except Exception:
+                    data = json.load(f)
+                if not isinstance(data, dict):
+                    raise ValueError("Configuration must be a JSON object.")
+            except (ValueError, UnicodeDecodeError):
+                backup = self._preserve_corrupt_config()
                 self._data = deepcopy(DEFAULT_CONFIG)
                 self.save()
+                warnings.warn(
+                    f"Invalid configuration preserved at {backup}; loaded defaults.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+            else:
+                self._data = data
         else:
             self._data = deepcopy(DEFAULT_CONFIG)
             self.save()
+
+    def _preserve_corrupt_config(self) -> Path:
+        # Keep the original in place until save() atomically replaces it. A unique
+        # backup name also preserves evidence from repeated recovery attempts.
+        with tempfile.NamedTemporaryFile(
+            mode="wb", prefix="config.json.corrupt-", suffix=".bak",
+            dir=self.config_dir, delete=False,
+        ) as backup:
+            backup_path = Path(backup.name)
+            try:
+                with self.config_file.open("rb") as original:
+                    shutil.copyfileobj(original, backup)
+                backup.flush()
+                os.fsync(backup.fileno())
+            except BaseException:
+                backup.close()
+                backup_path.unlink()
+                raise
+        return backup_path
 
     def save(self) -> None:
         self.config_dir.mkdir(parents=True, exist_ok=True)

@@ -2,7 +2,7 @@
 from unittest.mock import AsyncMock
 
 import pytest
-from textual.widgets import RichLog
+from textual.widgets import RichLog, TabbedContent
 
 from superagent.brain import TriageDecision
 from superagent.tui.app import PromptInput, SuperagentApp
@@ -29,7 +29,8 @@ async def test_multiline_prompt_submission_and_growth(tmp_path, monkeypatch):
         assert prompt.size.height == 1
         prompt.load_text('\n'.join(['x'] * 30))
         await pilot.pause()
-        assert prompt.size.height == 6
+        assert prompt.size.height == 30
+        assert not prompt.show_vertical_scrollbar
 
 
 @pytest.mark.asyncio
@@ -84,3 +85,73 @@ async def test_large_logs_are_bounded_batched_and_pageable(monkeypatch):
         assert 'LINE 09999 [literal]' in str(writes[-1])
         assert len(task.log_lines) == 10000
 
+
+@pytest.mark.asyncio
+async def test_keyboard_card_navigation_and_selection():
+    app = SuperagentApp()
+    async with app.run_test(size=(120, 40)) as pilot:
+        prompt = app.query_one('#prompt-input', PromptInput)
+        t1 = app.runner.create_task(agent='codex', task_desc='Task 1', project_name='test', cwd='.', effort='low')
+        t2 = app.runner.create_task(agent='agy', task_desc='Task 2', project_name='test', cwd='.', effort='medium')
+        t3 = app.runner.create_task(agent='claude', task_desc='Task 3', project_name='test', cwd='.', effort='high')
+
+        app._handle_runner_event_sync(t1, 'new')
+        app._handle_runner_event_sync(t2, 'new')
+        app._handle_runner_event_sync(t3, 'new')
+        await pilot.pause()
+
+        assert len(app.card_widgets) == 3
+        assert app.active_task_id == t1.task_id
+        assert app.card_widgets[t1.task_id].is_active_selection is True
+        assert prompt.has_focus is True
+
+        # Navigate next card from PromptInput using Alt+Down
+        await pilot.press('alt+down')
+        await pilot.pause()
+        assert app.active_task_id == t3.task_id
+        assert app.card_widgets[t3.task_id].is_active_selection is True
+        assert app.query_one('#main-tabs', TabbedContent).active == 'tab-console'
+        assert prompt.has_focus is True
+
+        # Navigate next card using Alt+J
+        await pilot.press('alt+j')
+        await pilot.pause()
+        assert app.active_task_id == t2.task_id
+        assert app.card_widgets[t2.task_id].is_active_selection is True
+
+        # Wrap around to first card
+        await pilot.press('alt+down')
+        await pilot.pause()
+        assert app.active_task_id == t1.task_id
+
+        # Navigate prev card using Alt+Up (wraps to t2)
+        await pilot.press('alt+up')
+        await pilot.pause()
+        assert app.active_task_id == t2.task_id
+
+        # Navigate prev card using Alt+K
+        await pilot.press('alt+k')
+        await pilot.pause()
+        assert app.active_task_id == t3.task_id
+
+        # Test direct card focus and key navigation (down/j, up/k, enter)
+        card2 = app.card_widgets[t3.task_id]
+        card2.focus()
+        await pilot.pause()
+        assert card2.has_focus is True
+
+        await pilot.press('down')
+        await pilot.pause()
+        assert app.active_task_id == t2.task_id
+
+        await pilot.press('up')
+        await pilot.pause()
+        assert app.active_task_id == t3.task_id
+
+        # Enter on focused card selects it
+        card1 = app.card_widgets[t1.task_id]
+        card1.focus()
+        await pilot.pause()
+        await pilot.press('enter')
+        await pilot.pause()
+        assert app.active_task_id == t1.task_id

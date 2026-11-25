@@ -13,6 +13,12 @@ from textual.widgets import Footer, Header, TextArea, Label, RichLog, Static, Ta
 from textual.widgets.option_list import Option
 from rich.markup import escape
 from rich.text import Text
+from rich.markdown import Markdown
+from rich.console import Group, RenderableType
+from rich.panel import Panel
+from rich.table import Table
+from rich import box
+from superagent.tui.logs import ReadingLog
 
 from superagent.brain import SuperagentBrain
 from superagent.config import SuperagentConfig, ProjectConfig
@@ -21,6 +27,8 @@ from superagent.history import HistoryManager, HistoryItem, Conversation, Subtas
 from superagent.runner import SubagentRunner, TaskRecord
 from superagent.execution import validate_project_path
 from superagent.tui.cards import SubagentCard, THROBBER_FRAMES
+from superagent.tui.bridge import InteractionBridge, PendingQuestion
+from superagent.tui.interaction import TaskInteractionView, TaskSelector
 
 APP_CSS = """
 Screen {
@@ -43,7 +51,9 @@ Screen {
 }
 
 #cards-pane {
-    width: 45%;
+    width: 38;
+    max-width: 42%;
+    min-width: 28;
     border: round $primary;
     height: 100%;
     padding: 0 1;
@@ -63,7 +73,7 @@ Screen {
 }
 
 #log-pane {
-    width: 55%;
+    width: 1fr;
     border: round $secondary;
     height: 100%;
     margin-left: 1;
@@ -127,18 +137,105 @@ RichLog {
     margin-bottom: 1;
 }
 
+#interaction-container {
+    dock: bottom;
+    height: auto;
+    max-height: 14;
+    padding: 0 1;
+    background: $surface-darken-1;
+    border-top: solid $accent;
+    display: none;
+}
+
+#interaction-container.visible {
+    display: block;
+}
+
+#awaiting-input-status {
+    height: 1;
+    color: $accent;
+    text-style: bold;
+    padding: 0 1;
+}
+
+#interaction-main-box {
+    height: auto;
+    max-height: 12;
+}
+
+#task-selector-box {
+    width: 38%;
+    height: auto;
+    padding-right: 1;
+}
+
+#task-details-box {
+    width: 62%;
+    height: auto;
+}
+
+#task-selector-label, #task-question-label {
+    height: 1;
+    color: $accent;
+    text-style: bold;
+}
+
+#task-selector {
+    height: 5;
+    border: round $primary;
+}
+
+#task-question {
+    height: auto;
+    max-height: 3;
+    padding: 0 1;
+}
+
+#task-options {
+    height: 4;
+    border: round $secondary;
+}
+
+#interaction-actions {
+    height: 3;
+    margin-top: 1;
+}
+
+#interaction-input {
+    width: 1fr;
+}
+
+#btn-submit-answer, #btn-send-context, #btn-cancel-task {
+    margin-left: 1;
+    min-width: 12;
+}
+
 #prompt-input {
     height: 3;
-    max-height: 8;
+    overflow-y: hidden;
+    overflow-x: hidden;
+    scrollbar-size-vertical: 0;
+    scrollbar-size-horizontal: 0;
     border: heavy $accent;
 }
 
 SubagentCard {
     border: round $surface-lighten-2;
-    height: 4;
+    min-height: 3;
+    max-height: 6;
+    height: auto;
     margin-bottom: 1;
     padding: 0 1;
     background: $surface-darken-1;
+}
+
+SubagentCard.expanded {
+    max-height: 100%;
+}
+
+SubagentCard.selected {
+    border: round $accent;
+    background: $surface-lighten-1;
 }
 
 SubagentCard:focus {
@@ -146,6 +243,110 @@ SubagentCard:focus {
     background: $surface;
 }
 """
+
+def render_direct_reply(reply_text: str) -> Panel:
+    """Renders direct replies cleanly with markdown tables and panel wrapping."""
+    return Panel(
+        Markdown(reply_text),
+        title="[bold cyan]🤖 SuperAgent Direct Reply[/bold cyan]",
+        title_align="left",
+        border_style="cyan",
+        box=box.ROUNDED,
+        padding=(0, 1),
+    )
+
+
+def render_fleet_plan(reasoning: str, tasks: List[Any]) -> Panel:
+    """Renders the subagent spawn plan in a formatted panel to prevent ugly line breaks."""
+    elements = [
+        Text.from_markup(f"💡 [bold white]Strategy:[/bold white] {escape(reasoning or 'Decomposing and launching in background.')}\n")
+    ]
+    if tasks:
+        table = Table(box=None, show_header=True, header_style="bold magenta", padding=(0, 1), expand=True)
+        table.add_column("#", width=3, style="dim")
+        table.add_column("Agent", style="bold green", width=10)
+        table.add_column("Effort", style="yellow", width=10)
+        table.add_column("Objective", style="white")
+
+        for idx, t in enumerate(tasks, 1):
+            agent = getattr(t, "agent", "bot").upper()
+            effort = getattr(t, "effort", "medium")
+            brief = getattr(t, "task_brief", getattr(t, "title", ""))
+            table.add_row(str(idx), f"[{agent}]", f"({effort})", brief)
+
+        elements.append(table)
+
+    elements.append(Text.from_markup("\n🚀 [dim]Status: Workers dispatched in background concurrently.[/dim]"))
+
+    return Panel(
+        Group(*elements),
+        title=f"[bold magenta]🚀 SuperAgent Fleet Plan • Spawning {len(tasks)} Subagent(s)[/bold magenta]",
+        title_align="left",
+        border_style="magenta",
+        box=box.ROUNDED,
+        padding=(0, 1),
+    )
+
+
+def render_fleet_synthesis(
+    user_prompt: str,
+    synthesis_text: str,
+    tasks_or_records: Optional[List[Any]] = None,
+) -> Panel:
+    """Renders an executive Fleet Synthesis panel with subagent dashboard and formatted markdown."""
+    tasks = tasks_or_records or []
+    successful = sum(getattr(t, "status", "") == "DONE" for t in tasks)
+    total = len(tasks)
+    outcome = "Completed" if total and successful == total else "Needs attention"
+
+    elements = [
+        Text.from_markup(f"[bold cyan]Fleet Synthesis | {outcome} | {successful}/{total} succeeded[/bold cyan]\n")
+    ]
+    if user_prompt:
+        elements.append(Text.from_markup(f"🎯 [bold white]Request:[/bold white] {escape(user_prompt)}\n"))
+
+    if tasks:
+        table = Table(box=box.SIMPLE_HEAD, show_header=True, header_style="bold cyan", padding=(0, 1), expand=True)
+        table.add_column("Agent", style="bold white", width=10)
+        table.add_column("Role / Objective", ratio=3)
+        table.add_column("Duration", style="yellow", width=10)
+        table.add_column("Status", width=12)
+        table.add_column("Git Changes", style="dim", ratio=2)
+
+        for t in tasks:
+            agent = getattr(t, "agent", "bot").upper()
+            brief = getattr(t, "task_desc", getattr(t, "task_brief", getattr(t, "title", "Task")))
+            elapsed = getattr(t, "elapsed_formatted", "--")
+            status = getattr(t, "status", "UNKNOWN")
+            if status == "DONE":
+                status_fmt = "[bold green]✔ DONE[/bold green]"
+            elif status == "FAILED":
+                status_fmt = "[bold red]✖ FAILED[/bold red]"
+            elif status == "CANCELLED":
+                status_fmt = "[magenta]🚫 CANCELLED[/magenta]"
+            else:
+                status_fmt = f"[cyan]{status}[/cyan]"
+            diff = getattr(t, "diff_summary", "") or "No changes"
+            table.add_row(agent, brief, elapsed, status_fmt, diff)
+
+        elements.append(table)
+        elements.append(Text(""))
+
+    # Render coordinator synthesis with Rich Markdown (which natively parses and formats markdown tables)
+    if synthesis_text:
+        elements.append(Markdown(synthesis_text))
+
+    elements.append(Text.from_markup("\n[dim]💡 Tip: Click any subagent card on the left or press Alt+Up/Down to inspect raw console logs • Ctrl+H for history[/dim]"))
+
+    return Panel(
+        Group(*elements),
+        title="[bold cyan]⚡ Fleet Synthesis[/bold cyan]",
+        title_align="left",
+        border_style="cyan",
+        box=box.ROUNDED,
+        padding=(0, 1),
+    )
+
 
 class PromptInput(TextArea):
     """Multiline prompt: Enter sends; Shift+Enter inserts a newline."""
@@ -155,6 +356,9 @@ class PromptInput(TextArea):
         Binding("shift+enter,ctrl+j", "newline", "New line", priority=True),
         Binding("ctrl+k", "app.cancel_active", "Cancel Task", priority=True),
         Binding("ctrl+y", "app.copy_active_log", "Copy Log", priority=True),
+        Binding("alt+x,alt+e", "app.toggle_active_card_expand", "Expand Card", priority=True),
+        Binding("alt+down,alt+j", "app.select_next_card", "Next Card", priority=True),
+        Binding("alt+up,alt+k", "app.select_prev_card", "Prev Card", priority=True),
     ]
 
     class Submitted(Message):
@@ -177,8 +381,22 @@ class PromptInput(TextArea):
     def action_newline(self) -> None:
         self.replace("\n", *self.selection)
 
+    def on_mount(self) -> None:
+        self.show_line_numbers = False
+        self.show_vertical_scrollbar = False
+        self.show_horizontal_scrollbar = False
+
     def on_text_area_changed(self, event: TextArea.Changed) -> None:
-        self.styles.height = min(6, max(1, self.text.count("\n") + 1)) + 2
+        self._fit_height()
+
+    def on_resize(self) -> None:
+        self.call_after_refresh(self._fit_height)
+
+    def _fit_height(self) -> None:
+        # Determine visual lines: check wrapped document height or explicit newlines
+        visual_lines = max(1, getattr(self.wrapped_document, "height", self.text.count("\n") + 1))
+        # Textbox expands upwards cleanly with no scrollbars.
+        self.styles.height = visual_lines + 2
 
 
 class RunnerEvent(Message):
@@ -199,6 +417,10 @@ class SuperagentApp(App):
         Binding("ctrl+k", "cancel_active", "Cancel Task", show=True),
         Binding("ctrl+l", "clear_finished", "Clear Done", show=True),
         Binding("ctrl+y", "copy_active_log", "Copy Log", show=True),
+        Binding("alt+x,alt+e", "toggle_active_card_expand", "Expand Card", show=True),
+        Binding("ctrl+m", "toggle_interaction", "Micromanage", show=True),
+        Binding("alt+down,alt+j", "select_next_card", "Next Card", show=True),
+        Binding("alt+up,alt+k", "select_prev_card", "Prev Card", show=True),
     ]
 
     def copy_to_clipboard(self, text: str) -> None:
@@ -240,7 +462,20 @@ class SuperagentApp(App):
         tabs.active = "tab-history"
         self.refresh_history_tab()
 
-    def __init__(self, initial_project: Optional[str] = None, start_new_conversation: bool = False):
+    def action_toggle_interaction(self) -> None:
+        self.show_interaction_pane = not getattr(self, "show_interaction_pane", False)
+        try:
+            interaction_view = self.query_one("#task-interaction-view", TaskInteractionView)
+            interaction_view.refresh_view()
+        except Exception:
+            pass
+
+    def __init__(
+        self,
+        initial_project: Optional[str] = None,
+        start_new_conversation: bool = False,
+        coordinator: Optional[Any] = None
+    ):
         super().__init__()
         self.cfg = SuperagentConfig()
         if initial_project:
@@ -260,6 +495,9 @@ class SuperagentApp(App):
         self._log_page_end = None
         self.start_new_conversation_flag = start_new_conversation
         self.current_conversation: Optional[Conversation] = None
+        self.coordinator = coordinator
+        self.bridge = InteractionBridge(coordinator=coordinator or self)
+        self.show_interaction_pane = False
         
         # Subscribe runner events to threadsafe UI callbacks
         self.runner.subscribe(self._dispatch_runner_callback)
@@ -282,13 +520,16 @@ class SuperagentApp(App):
             with Vertical(id="log-pane"):
                 with TabbedContent(id="main-tabs"):
                     with TabPane("🤖 SuperAgent Feed", id="tab-superagent"):
-                        yield RichLog(id="superagent-feed", highlight=True, markup=True, wrap=True)
+                        yield ReadingLog(id="superagent-feed", highlight=True, markup=True, wrap=True)
                         yield Static("[dim]⚡ Fleet idle • Standing by for next instruction[/dim]", id="feed-status-bar")
                     with TabPane("💻 Subagent Console", id="tab-console"):
-                        yield RichLog(id="subagent-log", max_lines=2000, highlight=False, markup=False, wrap=True)
+                        yield ReadingLog(id="subagent-log", max_lines=2000, highlight=False, markup=False, wrap=True)
                     with TabPane("📜 History", id="tab-history"):
                         yield Label("📜 CONVERSATION HISTORY  •  Select with ↑/↓ and press ENTER to resume in Feed", id="history-header")
                         yield OptionList(id="history-conversations-list")
+
+        with Container(id="interaction-container"):
+            yield TaskInteractionView(bridge=self.bridge, id="task-interaction-view")
 
         with Container(id="input-container"):
             yield PromptInput(
@@ -347,31 +588,12 @@ class SuperagentApp(App):
             for turn in conv.turns:
                 feed.write(f"\n[bold green]❯ [white]You:[/white] {escape(turn.user_prompt)}[/bold green]")
                 if turn.plan_action == "reply" and turn.direct_reply:
-                    feed.write(f"[bold cyan]╭─── [SuperAgent Direct Reply] ─────────────────[/bold cyan]")
-                    feed.write(f"[bold cyan]│[/bold cyan] [bold white]{escape(turn.direct_reply)}[/bold white]")
-                    feed.write(f"[bold cyan]╰───────────────────────────────────────────────[/bold cyan]\n")
+                    feed.write(render_direct_reply(turn.direct_reply))
                 elif turn.plan_action == "delegate":
-                    if turn.plan_reasoning:
-                        feed.write(f"[bold magenta]💡 Plan:[/bold magenta] {escape(turn.plan_reasoning)}")
-                    if turn.subtasks:
-                        for s in turn.subtasks:
-                            icon = "✔" if s.status == "DONE" else ("✖" if s.status == "FAILED" else "⚡")
-                            color = "green" if s.status == "DONE" else "red"
-                            feed.write(f"  • [bold white][{s.agent.upper()} ({s.effort})][/bold white] [{color}]{icon} {s.status}[/{color}] in [yellow]{s.elapsed_formatted}[/yellow]: {escape(s.task_brief)}")
-                            if s.output_clean:
-                                lines = [l for l in s.output_clean.splitlines() if l.strip()]
-                                if len(lines) <= 4 and len(s.output_clean) <= 300:
-                                    feed.write(f"[dim]    Findings: {escape(s.output_clean)}[/dim]")
-                                else:
-                                    preview = " ".join(lines[:2])
-                                    if len(preview) > 160:
-                                        preview = preview[:157] + "..."
-                                    feed.write(f"[dim]    Findings ({len(lines)} lines): {escape(preview)}[/dim]")
-                                    feed.write(f"[dim]    ↳ Select '[{s.agent.upper()}]' card on left or press Enter/Tab to inspect full report in Console.[/dim]")
-                            if s.diff_summary:
-                                feed.write(f"[dim]    Modified: {escape(s.diff_summary)}[/dim]")
+                    if turn.plan_reasoning or turn.subtasks:
+                        feed.write(render_fleet_plan(turn.plan_reasoning or "", turn.subtasks))
                     if turn.final_synthesis:
-                        feed.write(f"\n[bold cyan]📋 Fleet Synthesis:[/bold cyan]\n{escape(turn.final_synthesis)}\n")
+                        self._write_synthesis(feed, turn.final_synthesis, turn.subtasks, turn.user_prompt)
         else:
             feed.write("[dim]• Ready for instructions. Enter a task below.[/dim]\n")
 
@@ -434,7 +656,7 @@ class SuperagentApp(App):
                 card = SubagentCard(task_rec)
                 card.is_active_selection = (self.active_task_id == s.task_id)
                 self.card_widgets[s.task_id] = card
-                scroll.mount(card)
+                scroll.mount(card, before=0)
 
         # If active_task_id is unset or not in cards, set it to the last card
         if subtasks_to_show and (not self.active_task_id or self.active_task_id not in self.card_widgets):
@@ -444,6 +666,19 @@ class SuperagentApp(App):
         try:
             status_bar = self.query_one("#feed-status-bar", Static)
         except Exception:
+            return
+
+        # Prioritize tasks awaiting user input
+        awaiting = [
+            t for t in self.runner.tasks.values()
+            if t.status == "AWAITING_INPUT" or (hasattr(self, "bridge") and self.bridge.has_pending_question(t.task_id))
+        ]
+        if awaiting:
+            parts = [
+                f"❓ [bold yellow]{t.agent.upper()}[/bold yellow] #{t.task_id} ([bright_yellow]awaiting input[/bright_yellow])"
+                for t in awaiting
+            ]
+            status_bar.update(" | ".join(parts) + " • Select task to review question & choices")
             return
 
         running = [t for t in self.runner.tasks.values() if t.status in ("RUNNING", "TESTING")]
@@ -530,7 +765,7 @@ class SuperagentApp(App):
             target_id = self.active_task_id
             if not target_id and self.runner.tasks:
                 target_id = next(reversed(self.runner.tasks))
-            if target_id:
+            if target_id and target_id != self.active_task_id:
                 self.select_task(target_id, page_end=self._log_page_end)
         elif pane_id == "tab-history":
             self.refresh_history_tab()
@@ -539,6 +774,8 @@ class SuperagentApp(App):
         feed = self.query_one("#superagent-feed", RichLog)
 
         if event == "new":
+            if task.task_id in self.card_widgets:
+                return
             scroll = self.query_one("#cards-scroll", VerticalScroll)
             empty_notice = self.query("#cards-empty-notice")
             if empty_notice:
@@ -547,7 +784,7 @@ class SuperagentApp(App):
             card = SubagentCard(task)
             card.is_active_selection = (self.active_task_id == task.task_id)
             self.card_widgets[task.task_id] = card
-            scroll.mount(card)
+            scroll.mount(card, before=0)
 
             # If no active selection, select this one
             if not self.active_task_id:
@@ -563,9 +800,19 @@ class SuperagentApp(App):
                 log_widget.write(Text.from_ansi(line) if "\x1b" in line else line)
 
         elif event == "status":
+            if task.status in ("DONE", "FAILED", "CANCELLED") and hasattr(self, "bridge"):
+                self.bridge.cancel_task(task.task_id)
             card = self.card_widgets.get(task.task_id)
             if card:
+                if task.status in ("DONE", "FAILED", "CANCELLED"):
+                    card.is_awaiting_input = False
+                    card.pending_question = None
                 card.refresh_display()
+            try:
+                interaction_view = self.query_one("#task-interaction-view", TaskInteractionView)
+                interaction_view.refresh_view()
+            except Exception:
+                pass
 
             if task.status == "RUNNING":
                 feed.write(f"[bold cyan]🚀 [{task.agent.upper()}] actively executing Task #{task.task_id}...[/bold cyan]")
@@ -592,6 +839,12 @@ class SuperagentApp(App):
             card.is_active_selection = (tid == task_id)
             card.refresh_display()
 
+        try:
+            interaction_view = self.query_one("#task-interaction-view", TaskInteractionView)
+            interaction_view.set_selected_task(task_id)
+        except Exception:
+            pass
+
         task = self.runner.tasks.get(task_id)
         if task:
             try:
@@ -616,7 +869,10 @@ class SuperagentApp(App):
                 chunk = "\n".join(line[:4000] + (" [display truncated; Ctrl+Y copies full log]" if len(line) > 4000 else "") for line in lines_to_write[start:end])
                 log_widget.write(Text.from_ansi(chunk) if "\x1b" in chunk else Text(chunk))
             else:
-                log_widget.write("[dim]No output recorded for this task.[/dim]")
+                if task.status in ("RUNNING", "TESTING"):
+                    log_widget.write("[yellow]⏳ Subagent is actively running tools and reasoning in background... Output will appear momentarily.[/yellow]")
+                else:
+                    log_widget.write("[dim]No output recorded for this task.[/dim]")
 
     async def on_prompt_input_submitted(self, message: PromptInput.Submitted) -> None:
         prompt = message.value.strip()
@@ -635,6 +891,29 @@ class SuperagentApp(App):
         if prompt.startswith(":"):
             await self._handle_command(prompt)
             return
+
+        # If active task is awaiting input and user entered an option or answer
+        if self.active_task_id and self.bridge.has_pending_question(self.active_task_id):
+            pq = self.bridge.get_pending_question(self.active_task_id)
+            if pq:
+                is_choice = False
+                matched_answer = prompt
+                if pq.options and prompt.isdigit() and 1 <= int(prompt) <= len(pq.options):
+                    is_choice = True
+                    matched_answer = pq.options[int(prompt) - 1]
+                elif pq.options and any(prompt.lower() == opt.lower() for opt in pq.options):
+                    is_choice = True
+                    for opt in pq.options:
+                        if prompt.lower() == opt.lower():
+                            matched_answer = opt
+                            break
+                elif prompt.lower().startswith("answer:"):
+                    is_choice = True
+                    matched_answer = prompt.split(":", 1)[1].strip()
+
+                if is_choice:
+                    self.answer_question(self.active_task_id, matched_answer)
+                    return
 
         # Check project context
         proj = self.cfg.active_project
@@ -678,9 +957,7 @@ class SuperagentApp(App):
 
         # If it's a conversational / query prompt: answer directly in the feed without subprocess!
         if decision.action == "reply":
-            feed.write(f"[bold cyan]╭─── [SuperAgent Direct Reply] ─────────────────[/bold cyan]")
-            feed.write(f"[bold cyan]│[/bold cyan] [bold white]{escape(decision.reply_text or '')}[/bold white]")
-            feed.write(f"[bold cyan]╰───────────────────────────────────────────────[/bold cyan]\n")
+            feed.write(render_direct_reply(decision.reply_text or ""))
 
             # Save conversational turn to history
             turn_id = f"turn_{int(time.time())}_{uuid.uuid4().hex[:6]}"
@@ -704,21 +981,16 @@ class SuperagentApp(App):
         tasks = decision.tasks
         if not tasks:
             from superagent.brain import SubtaskItem
+            fallback_effort = self.brain.determine_effort(prompt)
             tasks = [SubtaskItem(
                 agent=proj.default_agent,
-                effort="medium",
+                effort=fallback_effort,
                 title=prompt[:30],
                 task_brief=prompt
             )]
 
         count = len(tasks)
-        feed.write(f"[bold magenta]╭─── [SuperAgent Plan: Spawning {count} Subagent(s)] ───[/bold magenta]")
-        feed.write(f"[bold magenta]│[/bold magenta] 💡 [bold white]Plan:[/bold white] {escape(decision.reasoning or 'Decomposing and launching in background.')}")
-        for idx, t in enumerate(tasks, 1):
-            feed.write(f"[bold magenta]│[/bold magenta] {idx}. [bold green][{t.agent.upper()}][/bold green] [yellow]({t.effort} effort)[/yellow]: {escape(t.title or t.task_brief[:40])}")
-            feed.write(f"[bold magenta]│[/bold magenta]    [dim]Brief: {escape(t.task_brief)}[/dim]")
-        feed.write(f"[bold magenta]│[/bold magenta] 🚀 [dim]Status: Workers dispatched in background.[/dim]")
-        feed.write(f"[bold magenta]╰───────────────────────────────────────────────[/bold magenta]\n")
+        feed.write(render_fleet_plan(decision.reasoning or "Decomposing and launching in background.", tasks))
 
         turn_id = f"turn_{int(time.time())}_{uuid.uuid4().hex[:6]}"
         turn_item = HistoryItem(
@@ -750,17 +1022,42 @@ class SuperagentApp(App):
         # Launch batch monitor and planning model synthesis!
         self.runner.supervisor.track(self._monitor_and_synthesize_batch(turn_item, task_records, proj))
 
+    @staticmethod
+    def _write_synthesis(feed: RichLog, synthesis: str, tasks, user_prompt: str = "") -> None:
+        feed.write(render_fleet_synthesis(user_prompt, synthesis, tasks))
+
     async def _monitor_and_synthesize_batch(
         self,
         turn_item: HistoryItem,
         task_records: List[TaskRecord],
         proj: ProjectConfig
     ) -> None:
+        total = len(task_records)
+        completed_ids = set()
+        feed = self.query_one("#superagent-feed", RichLog)
+
         # Wait until all subagents in this batch reach terminal state
         while any(t.status in ("QUEUED", "RUNNING", "TESTING") for t in task_records):
+            for t in task_records:
+                if t.task_id not in completed_ids and t.status in ("DONE", "FAILED", "CANCELLED"):
+                    completed_ids.add(t.task_id)
+                    remaining = total - len(completed_ids)
+                    if remaining > 0 and total > 1:
+                        feed.write(
+                            f"[dim]⏳ Batch progress: {len(completed_ids)}/{total} finished "
+                            f"({t.agent.upper()} in [yellow]{t.elapsed_formatted}[/yellow]), "
+                            f"waiting on {remaining} worker(s)...[/dim]"
+                        )
             await asyncio.sleep(0.5)
 
-        feed = self.query_one("#superagent-feed", RichLog)
+        for t in task_records:
+            if t.task_id not in completed_ids and t.status in ("DONE", "FAILED", "CANCELLED"):
+                completed_ids.add(t.task_id)
+
+        if total > 1:
+            feed.write(f"[bold magenta]⚡ All {total} subagents finished. Synthesizing findings...[/bold magenta]\n")
+        else:
+            feed.write(f"[bold magenta]⚡ Subagent finished. Synthesizing findings...[/bold magenta]\n")
 
         # Planning model synthesizes what all subagents accomplished
         synthesis = await self.brain.synthesize_results(
@@ -770,14 +1067,7 @@ class SuperagentApp(App):
             project_context=proj.to_dict()
         )
 
-        # Output synthesis to Feed
-        feed.write(f"\n[bold cyan]╭─── [SuperAgent Fleet Synthesis: Plan Completed] ───────[/bold cyan]")
-        feed.write(f"[bold cyan]│[/bold cyan] 🎯 [bold white]Original Request:[/bold white] {escape(turn_item.user_prompt)}")
-        feed.write(f"[bold cyan]│[/bold cyan] 📋 [bold white]Coordinator Summary:[/bold white]")
-        for sline in synthesis.splitlines():
-            feed.write(f"[bold cyan]│[/bold cyan]   {escape(sline)}")
-        feed.write(f"[bold cyan]│[/bold cyan] 💡 [dim]All tasks finished. Record saved to History (Ctrl+H).[/dim]")
-        feed.write(f"[bold cyan]╰───────────────────────────────────────────────────────────[/bold cyan]\n")
+        self._write_synthesis(feed, synthesis, task_records, turn_item.user_prompt)
 
         # Save to persistent history
         for t in task_records:
@@ -873,10 +1163,45 @@ class SuperagentApp(App):
 
         elif cmd == ":cancel":
             tid = parts[1] if len(parts) > 1 else self.active_task_id
-            if tid and self.runner.cancel_task(tid):
+            if tid and self.cancel_task(tid):
                 feed.write(f"[bold magenta]Task #{tid} cancelled.[/bold magenta]")
             else:
                 feed.write("[yellow]No active task to cancel.[/yellow]")
+
+        elif cmd in (":expand", ":exp"):
+            tid = parts[1] if len(parts) > 1 else self.active_task_id
+            if tid and tid in self.card_widgets:
+                self.card_widgets[tid].expand()
+            else:
+                feed.write("[yellow]No active task card to expand.[/yellow]")
+
+        elif cmd in (":collapse", ":col"):
+            tid = parts[1] if len(parts) > 1 else self.active_task_id
+            if tid and tid in self.card_widgets:
+                self.card_widgets[tid].collapse()
+            else:
+                feed.write("[yellow]No active task card to collapse.[/yellow]")
+
+        elif cmd in (":answer", ":choice", ":reply") and len(parts) > 1:
+            ans_text = " ".join(parts[1:]).strip()
+            tid = self.active_task_id
+            if tid:
+                self.answer_question(tid, ans_text)
+            else:
+                feed.write("[yellow]No active task selected to answer.[/yellow]")
+
+        elif cmd in (":context", ":ctx") and len(parts) > 1:
+            ctx_text = " ".join(parts[1:]).strip()
+            tid = self.active_task_id
+            if tid:
+                self.send_task_context(tid, ctx_text)
+            else:
+                feed.write("[yellow]No active task selected to send context.[/yellow]")
+
+        elif cmd in (":manage", ":micromanage", ":tasks"):
+            self.action_toggle_interaction()
+            state = "visible" if self.show_interaction_pane else "collapsed"
+            feed.write(f"[dim]Task interaction pane is now {state}.[/dim]")
 
         elif cmd in (":key", ":apikey") and len(parts) >= 2:
             key = parts[1]
@@ -947,6 +1272,8 @@ class SuperagentApp(App):
             feed.write("  Ctrl+H             - Switch to History tab (Enter on a conversation to resume)")
             feed.write("  Ctrl+P             - Cycle active project (auto-resumes last conversation)")
             feed.write("  Ctrl+Y             - Copy active log to clipboard")
+            feed.write("  Alt+Down / Alt+J   - Select next subagent card (or Up/Down on card)")
+            feed.write("  Alt+Up / Alt+K     - Select previous subagent card")
             feed.write("  Ctrl+Q             - Exit SuperAgent")
             feed.write("[dim]Note: Conversational prompts answer directly. Coding tasks delegate with adaptive effort.[/dim]\n")
         else:
@@ -954,7 +1281,183 @@ class SuperagentApp(App):
 
     def action_cancel_active(self) -> None:
         if self.active_task_id:
-            self.runner.cancel_task(self.active_task_id)
+            self.cancel_task(self.active_task_id)
+
+    def get_pending_questions(self) -> Dict[str, PendingQuestion]:
+        """Returns all unresolved pending questions."""
+        return self.bridge.get_pending_questions()
+
+    def get_pending_question(self, task_id: str) -> Optional[PendingQuestion]:
+        """Returns the pending question for the specified task, if any."""
+        return self.bridge.get_pending_question(task_id)
+
+    def ask_question(
+        self,
+        task_id: str,
+        question: str,
+        options: Optional[List[str]] = None
+    ) -> PendingQuestion:
+        """Prompts a question with optional choices for a specific task."""
+        pq = self.bridge.ask_question(task_id, question, options)
+        card = self.card_widgets.get(task_id)
+        if card:
+            card.is_awaiting_input = True
+            card.pending_question = pq
+            card.refresh_display()
+
+        task = self.runner.tasks.get(task_id)
+        agent_str = task.agent.upper() if task else "TASK"
+        try:
+            feed = self.query_one("#superagent-feed", RichLog)
+            feed.write(f"\n[bold yellow]❓ [{agent_str}] Task #{task_id} requires user input:[/bold yellow] [bold white]{escape(question)}[/bold white]")
+            if options:
+                for idx, opt in enumerate(options, 1):
+                    feed.write(f"  [yellow]{idx}.[/yellow] {escape(opt)}")
+                feed.write("[dim]Choose an option above, type :answer <text>, or use the task interaction panel.[/dim]\n")
+        except Exception:
+            pass
+
+        self._update_active_status_bar()
+        try:
+            interaction_view = self.query_one("#task-interaction-view", TaskInteractionView)
+            interaction_view.refresh_view()
+        except Exception:
+            pass
+        return pq
+
+    def prompt_question(
+        self,
+        task_id: str,
+        question: str,
+        options: Optional[List[str]] = None
+    ) -> PendingQuestion:
+        """Alias for ask_question."""
+        return self.ask_question(task_id, question, options)
+
+    def answer_question(self, task_id: str, answer: str) -> bool:
+        """Answers a pending question targeting only the specified task."""
+        ok = self.bridge.answer_question(task_id, answer, from_coordinator=True)
+        card = self.card_widgets.get(task_id)
+        if card:
+            card.is_awaiting_input = False
+            card.pending_question = None
+            card.refresh_display()
+
+        task = self.runner.tasks.get(task_id)
+        agent_str = task.agent.upper() if task else "TASK"
+        if task:
+            task.log_lines.append(f"[USER ANSWER] {answer}")
+            self._notify_runner_log(task)
+
+        try:
+            feed = self.query_one("#superagent-feed", RichLog)
+            feed.write(f"[bold cyan]✔ [{agent_str}] Task #{task_id} received answer:[/bold cyan] {escape(answer)}")
+        except Exception:
+            pass
+
+        self._update_active_status_bar()
+        try:
+            interaction_view = self.query_one("#task-interaction-view", TaskInteractionView)
+            interaction_view.refresh_view()
+        except Exception:
+            pass
+        return ok
+
+    def send_task_context(self, task_id: str, context: str) -> bool:
+        """Sends targeted context to the specified task only."""
+        ok = self.bridge.send_context(task_id, context, from_coordinator=True)
+        task = self.runner.tasks.get(task_id)
+        agent_str = task.agent.upper() if task else "TASK"
+        if task:
+            task.log_lines.append(f"[USER CONTEXT] {context}")
+            if not hasattr(task, "contexts"):
+                task.contexts = []
+            task.contexts.append(context)
+            self._notify_runner_log(task)
+
+        try:
+            feed = self.query_one("#superagent-feed", RichLog)
+            feed.write(f"[bold cyan]📥 [{agent_str}] Added context to Task #{task_id}:[/bold cyan] {escape(context)}")
+        except Exception:
+            pass
+
+        try:
+            interaction_view = self.query_one("#task-interaction-view", TaskInteractionView)
+            interaction_view.refresh_view()
+        except Exception:
+            pass
+        return ok
+
+    def send_context(self, task_id: str, context: str) -> bool:
+        """Alias for send_task_context."""
+        return self.send_task_context(task_id, context)
+
+    def cancel_task(self, task_id: str) -> bool:
+        """Cancels the specified task only."""
+        cancelled = self.runner.cancel_task(task_id)
+        self.bridge.cancel_task(task_id, from_coordinator=True)
+        card = self.card_widgets.get(task_id)
+        if card:
+            card.is_awaiting_input = False
+            card.pending_question = None
+            card.refresh_display()
+
+        self._update_active_status_bar()
+        try:
+            interaction_view = self.query_one("#task-interaction-view", TaskInteractionView)
+            interaction_view.refresh_view()
+        except Exception:
+            pass
+        return cancelled
+
+    def _notify_runner_log(self, task: TaskRecord) -> None:
+        if self.active_task_id == task.task_id and task.log_lines and self._log_page_end is None:
+            try:
+                log_widget = self.query_one("#subagent-log", RichLog)
+                line = task.log_lines[-1]
+                log_widget.write(Text.from_ansi(line) if "\x1b" in line else line)
+            except Exception:
+                pass
+
+    def action_select_next_card(self) -> None:
+        if not self.card_widgets:
+            return
+        card_ids = list(reversed(self.card_widgets))
+        if not self.active_task_id or self.active_task_id not in card_ids:
+            next_id = card_ids[0]
+        else:
+            curr_idx = card_ids.index(self.active_task_id)
+            next_id = card_ids[(curr_idx + 1) % len(card_ids)]
+        self.select_task(next_id)
+        card = self.card_widgets.get(next_id)
+        if card:
+            card.scroll_visible()
+            if any(c.has_focus for c in self.card_widgets.values()):
+                card.focus()
+        tabs = self.query_one("#main-tabs", TabbedContent)
+        tabs.active = "tab-console"
+
+    def action_select_prev_card(self) -> None:
+        if not self.card_widgets:
+            return
+        card_ids = list(reversed(self.card_widgets))
+        if not self.active_task_id or self.active_task_id not in card_ids:
+            prev_id = card_ids[-1]
+        else:
+            curr_idx = card_ids.index(self.active_task_id)
+            prev_id = card_ids[(curr_idx - 1) % len(card_ids)]
+        self.select_task(prev_id)
+        card = self.card_widgets.get(prev_id)
+        if card:
+            card.scroll_visible()
+            if any(c.has_focus for c in self.card_widgets.values()):
+                card.focus()
+        tabs = self.query_one("#main-tabs", TabbedContent)
+        tabs.active = "tab-console"
+
+    def action_toggle_active_card_expand(self) -> None:
+        if self.active_task_id and self.active_task_id in self.card_widgets:
+            self.card_widgets[self.active_task_id].toggle_expand()
 
     def action_clear_finished(self) -> None:
         scroll = self.query_one("#cards-scroll", VerticalScroll)

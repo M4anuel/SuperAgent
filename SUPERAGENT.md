@@ -23,9 +23,9 @@ This document defines the roles, delegation rules, and operating guidelines for 
    * Both workers run concurrently in parallel.
 
 2. **Adaptive Reasoning Effort**:
-   * **`low`**: Typos, single variable renames, docstrings, formatting, status checks (runs in seconds).
-   * **`medium`**: Feature implementations, unit tests, code reviews, audits (runs in 1–3 minutes).
-   * **`high`**: Architectural rewrites, concurrency/race conditions, complex multi-file bugs (runs in 4–8 minutes).
+   * **`low` (Default for Routine Tasks)**: Typos, single variable renames, docstrings, formatting, status checks (runs in seconds).
+   * **`medium` (Default for Substantial Work)**: Feature implementations, unit tests, code reviews, audits (runs in 1–3 minutes).
+   * **`high` (Reserved for Rare, Explicitly Justified Complexity)**: Architectural rewrites, concurrency/race conditions, complex multi-file bugs, or explicit deep reasoning requests (runs in 4–8 minutes).
 
 3. **Repository Rules & `AGENTS.md`**:
    * If the active project contains an `AGENTS.md`, `CLAUDE.md`, or `README.md`, subagents must preserve existing architecture, run tests before completion, and respect project branch conventions.
@@ -53,7 +53,12 @@ To prevent 15-minute idle timeouts, PowerShell permission errors, and file write
    * Subagents must operate strictly within the active repository root (`cwd`).
    * Never run recursive searches across root directories (e.g. `C:\Users` or parent paths), which trigger Windows permission denials (`Access Denied`) and cause subagents to abort.
 
-4. **Self-Modification Safety Rule (Improving SuperAgent Itself)**:
+4. **Delegation Prompt Generation (Scoped Assignments)**:
+   * Each subagent prompt is rewritten into a self-contained assignment containing only its relevant goal, context, owned files/modules, constraints, and acceptance criteria.
+   * SuperAgent never forwards the full original prompt with a generic frontend/backend qualifier (e.g. `Focus on backend logic...: <prompt>`).
+   * Explicit user requirements and explicit agent choices (`@codex`, `@agy`, `@claude`) are strictly preserved.
+
+5. **Self-Modification Safety Rule (Improving SuperAgent Itself)**:
    * When SuperAgent is tasked with improving its own codebase:
      * Subagents must develop in an isolated git worktree or branch (`git worktree add ../SuperAgent-dev`), verify with `pytest`, and avoid in-flight mutation of running `.py` files.
      * All persistent state saves (`config.json`, conversation history) use atomic temporary-file replacement with `os.replace` and `os.fsync` to prevent file corruption.

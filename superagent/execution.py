@@ -32,7 +32,7 @@ def agent_command(agent: str, prompt: str, cwd: str, effort: str = 'medium',
     if agent == 'agy':
         flags = (['--dangerously-skip-permissions'] if profile == 'unrestricted'
                  else ['--sandbox', '--mode', 'plan' if profile == 'read-only' else 'accept-edits'])
-        return ['agy', *flags, '--effort', effort, '-p', prompt]
+        return ['agy', *flags, '--effort', effort, '--output-format', 'stream-json', '-p', prompt]
     if agent == 'claude':
         flags = (['--dangerously-skip-permissions'] if profile == 'unrestricted'
                  else ['--permission-mode', 'plan' if profile == 'read-only' else 'acceptEdits'])
